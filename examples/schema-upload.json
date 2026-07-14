@@ -1,0 +1,60 @@
+{
+  "tables": [
+    {
+      "table_name": "users",
+      "table_comment": "用户表",
+      "columns": [
+        {
+          "column_name": "id",
+          "data_type": "int",
+          "column_comment": "主键"
+        },
+        {
+          "column_name": "username",
+          "data_type": "varchar(50)",
+          "column_comment": "用户名"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "datetime",
+          "column_comment": "创建时间"
+        }
+      ]
+    },
+    {
+      "table_name": "orders",
+      "table_comment": "订单表",
+      "columns": [
+        {
+          "column_name": "id",
+          "data_type": "int",
+          "column_comment": "主键"
+        },
+        {
+          "column_name": "user_id",
+          "data_type": "int",
+          "column_comment": "用户ID"
+        },
+        {
+          "column_name": "amount",
+          "data_type": "decimal(10,2)",
+          "column_comment": "订单金额"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "datetime",
+          "column_comment": "创建时间"
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from_table": "users",
+      "from_column": "id",
+      "to_table": "orders",
+      "to_column": "user_id",
+      "relation_type": "one_to_many"
+    }
+  ]
+}
