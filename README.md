@@ -1,5 +1,35 @@
 # sqlGenie
 
+## Interface preview
+
+### SQL workbench
+
+![SQL workbench](docs/images/sql-workbench.png)
+
+### User management
+
+![User management](docs/images/user-management.png)
+
+### Schema management
+
+![Schema management](docs/images/schema-management.png)
+
+### Schema preview
+
+![Schema preview](docs/images/schema-preview.png)
+
+### Query history
+
+![Query history](docs/images/query-history.png)
+
+### Model configuration
+
+![Model configuration](docs/images/model-configuration.png)
+
+### Feedback RAG management
+
+![Feedback RAG management](docs/images/feedback-rag-management.png)
+
 ## Security configuration
 
 The default launch mode binds to localhost. Before setting `APP_HOST` or
