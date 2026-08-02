@@ -94,3 +94,23 @@ test('保存响应缺少思考强度时保留当前选择，但显式 null 仍�
   const cleared = mapModelConfigResponse({ reasoning_effort: null }, current)
   assert.equal(cleared.form.reasoning_effort, null)
 })
+
+test('嵌入模型路径留空时保存载荷不包含该字段', () => {
+  const payload = buildModelConfigPayload({
+    base_url: 'https://example.test/v1',
+    model_name: 'model-a',
+    embedding_model_path: '   ',
+  })
+
+  assert.equal(Object.hasOwn(payload, 'embedding_model_path'), false)
+})
+
+test('配置了嵌入模型路径时才会进入保存载荷', () => {
+  const payload = buildModelConfigPayload({
+    base_url: 'https://example.test/v1',
+    model_name: 'model-a',
+    embedding_model_path: ' models/Qwen3-Embedding-0.6B ',
+  })
+
+  assert.equal(payload.embedding_model_path, 'models/Qwen3-Embedding-0.6B')
+})

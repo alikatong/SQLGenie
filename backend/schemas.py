@@ -5,6 +5,11 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+def _validate_bcrypt_password_bytes(value: str) -> None:
+    if len(value.encode("utf-8")) > 72:
+        raise ValueError("密码过长：bcrypt 仅支持 72 字节以内的密码。")
+
+
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=50)
     password: str = Field(..., min_length=1, max_length=128)
@@ -20,6 +25,11 @@ class UserCreateRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=72)
     role: Literal["admin", "user"] = "user"
 
+    @model_validator(mode="after")
+    def validate_password_bytes(self) -> "UserCreateRequest":
+        _validate_bcrypt_password_bytes(self.password)
+        return self
+
 
 class UserOut(BaseModel):
     id: int
@@ -30,6 +40,11 @@ class UserOut(BaseModel):
 
 class UserPasswordResetRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=72)
+
+    @model_validator(mode="after")
+    def validate_password_bytes(self) -> "UserPasswordResetRequest":
+        _validate_bcrypt_password_bytes(self.password)
+        return self
 
 
 class UserRoleUpdateRequest(BaseModel):

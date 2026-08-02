@@ -8,13 +8,13 @@ from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from time import monotonic
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, Response
 
 from .auth import create_access_token, get_current_user, require_admin
-from .config import settings, validate_security_configuration
+from .config import cors_allow_credentials, settings, validate_security_configuration
 from .config import validate_qwen_embedding_model_path
 from .crud import (
     FeedbackValidationError,
@@ -60,6 +60,7 @@ from .generation import GenerationError, orchestrate_sql_generation
 from .his_semantics import retrieve_his_semantics
 from .intent import analyze_intent
 from .models import AuthenticatedUser
+from .rate_limit import SlidingWindowRateLimiter
 from .rag import (
     initialize_database_rag,
     retrieve_schema_context,
@@ -135,6 +136,15 @@ def _apply_no_cache(response: Response) -> Response:
     return response
 
 
+def _sync_feedback_rag_index(connection: sqlite3.Connection, db_id: int) -> None:
+    runtime = get_model_runtime_config(connection)
+    sync_sql_feedback_rag_index(
+        connection,
+        db_id,
+        embedding_model_path=str(runtime["embedding_model_path"]),
+    )
+
+
 class NoCacheStaticFiles(StaticFiles):
     def file_response(
         self,
@@ -150,10 +160,19 @@ app = FastAPI(title="sqlGenie API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list or ["*"],
-    allow_credentials=True,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=cors_allow_credentials(settings.cors_origin_list),
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+login_limiter = SlidingWindowRateLimiter(
+    settings.login_rate_limit_max,
+    settings.login_rate_limit_window_seconds,
+)
+generate_limiter = SlidingWindowRateLimiter(
+    settings.generate_rate_limit_max,
+    settings.generate_rate_limit_window_seconds,
 )
 
 
@@ -172,7 +191,15 @@ def health_check() -> dict[str, str]:
 
 
 @app.post("/api/login", response_model=LoginResponse)
-def login(payload: LoginRequest) -> LoginResponse:
+def login(payload: LoginRequest, request: Request) -> LoginResponse:
+    client_host = request.client.host if request.client is not None else "unknown"
+    if not login_limiter.allow(client_host):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="登录尝试过于频繁，请稍后再试。",
+            headers={"Retry-After": str(settings.login_rate_limit_window_seconds)},
+        )
+
     with db_session() as connection:
         user = authenticate_user(connection, payload.username.strip(), payload.password)
 
@@ -416,6 +443,7 @@ async def generate_sql(
     request_id = str(uuid.uuid4())
     request_started_at = monotonic()
     dialect_mismatch = False
+    key = f"user:{current_user.id}"
     with db_session() as connection:
         schema_bundle = get_schema_bundle(connection, payload.db_id)
         model_config = get_model_runtime_config(connection)
@@ -425,7 +453,17 @@ async def generate_sql(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="数据库定义不存在。",
             )
+
         dialect_mismatch = payload.target_db_type != schema_bundle["db_definition"]["db_type"]
+        # Invalid database ids and dialect mismatches do not consume the
+        # generation budget; only requests that can reach generation do.
+        if not dialect_mismatch and not generate_limiter.allow(key):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="SQL 生成请求过于频繁，请稍后再试。",
+                headers={"Retry-After": str(settings.generate_rate_limit_window_seconds)},
+            )
+
         if not dialect_mismatch:
             semantic_context = retrieve_his_semantics(
                 connection,
@@ -447,6 +485,7 @@ async def generate_sql(
                 explicit_tables=intent_result.explicit_tables,
                 explicit_columns=intent_result.explicit_columns,
                 top_k=int(model_config["rag_top_k"]),
+                embedding_model_path=str(model_config["embedding_model_path"]),
             )
             feedback_context = retrieve_sql_feedback_context(
                 connection,
@@ -454,6 +493,7 @@ async def generate_sql(
                 question=payload.natural_text,
                 target_db_type=payload.target_db_type,
                 top_k=int(model_config["feedback_rag_top_k"]),
+                embedding_model_path=str(model_config["embedding_model_path"]),
             )
 
     if dialect_mismatch:
@@ -622,7 +662,7 @@ def submit_sql_feedback(
                     detail="未找到对应的 SQL 生成记录。",
                 )
             if feedback["approved"]:
-                sync_sql_feedback_rag_index(connection, feedback["db_id"])
+                _sync_feedback_rag_index(connection, feedback["db_id"])
             return feedback
     except sqlite3.IntegrityError as exc:
         raise HTTPException(
@@ -665,7 +705,7 @@ def remove_feedback_rag_example(
         db_id = delete_sql_feedback(connection, feedback_id)
         if db_id is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到反馈示例。")
-        sync_sql_feedback_rag_index(connection, db_id)
+        _sync_feedback_rag_index(connection, db_id)
 
 
 @app.post("/api/feedback-rag/examples/{feedback_id}/approve", status_code=status.HTTP_204_NO_CONTENT)
@@ -678,7 +718,7 @@ def approve_feedback_rag_example(
             db_id = approve_sql_feedback(connection, feedback_id)
             if db_id is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback example not found.")
-            sync_sql_feedback_rag_index(connection, db_id)
+            _sync_feedback_rag_index(connection, db_id)
     except FeedbackValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -825,7 +865,6 @@ def initialize_embedding_rag(
                 detail={"code": "INVALID_EMBEDDING_MODEL", "message": str(exc)},
             ) from exc
 
-        settings.rag_embedding_model = model_path
         database_definitions = list_db_definitions(connection)
         initialized_databases: list[dict] = []
         failed_databases: list[dict] = []
@@ -844,7 +883,11 @@ def initialize_embedding_rag(
                 schema_bundle = get_schema_bundle(connection, int(database["id"]))
                 if schema_bundle is None:
                     raise ValueError("数据库定义不存在。")
-                stats = initialize_database_rag(connection, schema_bundle)
+                stats = initialize_database_rag(
+                    connection,
+                    schema_bundle,
+                    embedding_model_path=model_path,
+                )
                 result["table_count"] = int(stats["table_count"])
                 result["feedback_example_count"] = int(stats["feedback_example_count"])
                 schema_table_count += result["table_count"]
@@ -874,6 +917,19 @@ def _frontend_file_response(path: Path) -> Response:
     return _apply_no_cache(FileResponse(path))
 
 
+def _frontend_path_within_dist(full_path: str) -> Path | None:
+    """Resolve a request path strictly inside the built frontend directory."""
+    if not frontend_dist.is_dir():
+        return None
+    root = frontend_dist.resolve()
+    try:
+        candidate = (root / full_path).resolve()
+        candidate.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return candidate
+
+
 if frontend_dist.exists():
     assets_dir = frontend_dist / "assets"
     if assets_dir.exists():
@@ -892,7 +948,12 @@ if frontend_dist.exists():
                 detail="接口不存在。",
             )
 
-        requested_path = frontend_dist / full_path
-        if requested_path.exists() and requested_path.is_file():
+        requested_path = _frontend_path_within_dist(full_path)
+        if requested_path is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="资源不存在。",
+            )
+        if requested_path.is_file():
             return _frontend_file_response(requested_path)
         return _frontend_file_response(frontend_dist / "index.html")

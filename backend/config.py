@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ INSECURE_DEFAULT_ADMIN_PASSWORD = "admin123"
 EXAMPLE_SECRET_KEY = "replace-with-a-long-random-secret"
 EXAMPLE_ADMIN_PASSWORD = "replace-with-a-strong-admin-password"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+DEFAULT_CORS_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
 REASONING_EFFORT_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
 DEFAULT_REASONING_EFFORT: str | None = None
 DEFAULT_PROMPT_MAX_CHARS = 60_000
@@ -112,6 +114,32 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def resolve_cors_origins(raw_value: object = None) -> list[str]:
+    """Parse a comma-separated CORS origin list with a loopback fallback."""
+    raw = str(
+        raw_value
+        if raw_value is not None
+        else os.getenv("CORS_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS))
+    ).strip()
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return items or list(DEFAULT_CORS_ORIGINS)
+
+
+def cors_allow_credentials(origins: list[str] | tuple[str, ...]) -> bool:
+    """Credentials must never be combined with a wildcard origin."""
+    return "*" not in origins
+
+
 _load_dotenv()
 
 
@@ -150,22 +178,36 @@ class Settings:
     )
     rag_chroma_path: Path = _resolve_db_path(os.getenv("RAG_CHROMA_PATH", ".chroma"))
     rag_top_k: int = min(max(int(os.getenv("RAG_TOP_K", "8")), 1), 20)
-    rag_expand_depth: int = int(os.getenv("RAG_EXPAND_DEPTH", "1"))
-    rag_min_keyword_hits: int = int(os.getenv("RAG_MIN_KEYWORD_HITS", "2"))
-    rag_min_keyword_score: float = float(os.getenv("RAG_MIN_KEYWORD_SCORE", "6.0"))
-    rag_min_vector_similarity: float = float(os.getenv("RAG_MIN_VECTOR_SIMILARITY", "0.65"))
-    rag_min_vector_margin: float = float(os.getenv("RAG_MIN_VECTOR_MARGIN", "0.08"))
-    his_term_top_k: int = min(max(int(os.getenv("HIS_TERM_TOP_K", "8")), 1), 20)
-    feedback_rag_top_k: int = int(os.getenv("FEEDBACK_RAG_TOP_K", "3"))
+    rag_expand_depth: int = _env_int("RAG_EXPAND_DEPTH", 1, 0, 3)
+    rag_min_keyword_hits: int = _env_int("RAG_MIN_KEYWORD_HITS", 2, 1, 20)
+    rag_min_keyword_score: float = _env_float("RAG_MIN_KEYWORD_SCORE", 6.0, 0.0, 1000.0)
+    rag_min_vector_similarity: float = _env_float("RAG_MIN_VECTOR_SIMILARITY", 0.65, 0.0, 1.0)
+    rag_min_vector_margin: float = _env_float("RAG_MIN_VECTOR_MARGIN", 0.08, 0.0, 1.0)
+    his_term_top_k: int = _env_int("HIS_TERM_TOP_K", 8, 1, 20)
+    feedback_rag_top_k: int = _env_int("FEEDBACK_RAG_TOP_K", 3, 1, 20)
     rag_collection_prefix: str = os.getenv("RAG_COLLECTION_PREFIX", "sqlgenie")
+    login_rate_limit_max: int = _env_int("LOGIN_RATE_LIMIT_MAX", 20, 0, 10_000)
+    login_rate_limit_window_seconds: int = _env_int(
+        "LOGIN_RATE_LIMIT_WINDOW_SECONDS",
+        300,
+        1,
+        86_400,
+    )
+    generate_rate_limit_max: int = _env_int("GENERATE_RATE_LIMIT_MAX", 30, 0, 10_000)
+    generate_rate_limit_window_seconds: int = _env_int(
+        "GENERATE_RATE_LIMIT_WINDOW_SECONDS",
+        60,
+        1,
+        86_400,
+    )
     cors_origins: str = os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+        ",".join(DEFAULT_CORS_ORIGINS),
     )
 
     @property
     def cors_origin_list(self) -> list[str]:
-        return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+        return resolve_cors_origins(self.cors_origins)
 
 
 settings = Settings()

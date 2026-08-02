@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.config import settings, validate_security_configuration
+from backend.config import (
+    _env_float,
+    cors_allow_credentials,
+    resolve_cors_origins,
+    settings,
+    validate_security_configuration,
+)
 from backend.crud import validate_persisted_admin_password
 from backend.database import db_session, init_db
 
@@ -51,3 +58,24 @@ class SecurityConfigurationTests(unittest.TestCase):
                     with db_session() as connection:
                         with self.assertRaises(RuntimeError):
                             validate_persisted_admin_password(connection)
+
+    def test_empty_cors_config_falls_back_to_loopback_origins(self) -> None:
+        with patch.object(settings, "cors_origins", ""):
+            self.assertEqual(
+                settings.cors_origin_list,
+                ["http://localhost:5173", "http://127.0.0.1:5173"],
+            )
+
+    def test_wildcard_cors_disables_credentials(self) -> None:
+        self.assertFalse(cors_allow_credentials(["*"]))
+        self.assertTrue(cors_allow_credentials(["http://localhost:5173", "http://127.0.0.1:5173"]))
+
+    def test_resolve_cors_origins_ignores_blank_entries(self) -> None:
+        self.assertEqual(
+            resolve_cors_origins(" , http://localhost:5173 , "),
+            ["http://localhost:5173"],
+        )
+
+    def test_nonfinite_float_config_uses_default(self) -> None:
+        with patch.dict(os.environ, {"SQLGENIE_TEST_FLOAT": "nan"}):
+            self.assertEqual(_env_float("SQLGENIE_TEST_FLOAT", 6.0, 0.0, 100.0), 6.0)

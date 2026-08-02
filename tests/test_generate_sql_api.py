@@ -131,10 +131,13 @@ class GenerateSqlApiTests(unittest.TestCase):
             )
 
         from backend.rag import retrieve_schema_context as real_retrieve_schema_context
+        from backend.rag import retrieve_sql_feedback_context as real_retrieve_sql_feedback_context
 
         with patch("backend.main.orchestrate_sql_generation", AsyncMock(return_value=_result())), patch(
             "backend.main.retrieve_schema_context", wraps=real_retrieve_schema_context
-        ) as retrieve_schema_context, patch("backend.rag._vector_search_available", return_value=False):
+        ) as retrieve_schema_context, patch(
+            "backend.main.retrieve_sql_feedback_context", wraps=real_retrieve_sql_feedback_context
+        ) as retrieve_feedback_context, patch("backend.rag._vector_search_available", return_value=False):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/generate-sql",
@@ -144,6 +147,14 @@ class GenerateSqlApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(retrieve_schema_context.call_args.kwargs["top_k"], 12)
+        self.assertEqual(
+            retrieve_schema_context.call_args.kwargs["embedding_model_path"],
+            settings.rag_embedding_model,
+        )
+        self.assertEqual(
+            retrieve_feedback_context.call_args.kwargs["embedding_model_path"],
+            settings.rag_embedding_model,
+        )
 
     def test_low_evidence_returns_no_sql_without_remote_call(self) -> None:
         orchestrator = AsyncMock()
@@ -310,6 +321,116 @@ class GenerateSqlApiTests(unittest.TestCase):
         self.assertEqual(response.json()["sql"], "NO_SQL")
         self.assertEqual(response.json()["no_sql_code"], "LOW_SCHEMA_EVIDENCE")
         remote_call.assert_not_awaited()
+
+    def test_generate_returns_429_when_rate_limit_exceeded(self) -> None:
+        import backend.main as main_module
+        from backend.rate_limit import SlidingWindowRateLimiter
+
+        with patch.object(
+            main_module,
+            "generate_limiter",
+            SlidingWindowRateLimiter(max_requests=2, window_seconds=60),
+        ), patch(
+            "backend.main.orchestrate_sql_generation", AsyncMock(return_value=_result())
+        ), patch("backend.rag._vector_search_available", return_value=False):
+            with TestClient(app) as client:
+                first = client.post(
+                    "/api/generate-sql",
+                    headers=self.headers,
+                    json={"db_id": self.database["id"], "natural_text": "list orders", "target_db_type": "mysql"},
+                )
+                second = client.post(
+                    "/api/generate-sql",
+                    headers=self.headers,
+                    json={"db_id": self.database["id"], "natural_text": "list orders", "target_db_type": "mysql"},
+                )
+                third = client.post(
+                    "/api/generate-sql",
+                    headers=self.headers,
+                    json={"db_id": self.database["id"], "natural_text": "list orders", "target_db_type": "mysql"},
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(third.status_code, 429)
+
+    def test_dialect_mismatch_does_not_consume_generation_budget(self) -> None:
+        import backend.main as main_module
+        from backend.rate_limit import SlidingWindowRateLimiter
+
+        with patch.object(
+            main_module,
+            "generate_limiter",
+            SlidingWindowRateLimiter(max_requests=1, window_seconds=60),
+        ), patch("backend.rag._vector_search_available", return_value=False):
+            with TestClient(app) as client:
+                for _ in range(3):
+                    response = client.post(
+                        "/api/generate-sql",
+                        headers=self.headers,
+                        json={
+                            "db_id": self.database["id"],
+                            "natural_text": "list orders",
+                            "target_db_type": "pg",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 400)
+
+    def test_unknown_database_does_not_consume_generation_budget(self) -> None:
+        import backend.main as main_module
+        from backend.rate_limit import SlidingWindowRateLimiter
+
+        with patch.object(
+            main_module,
+            "generate_limiter",
+            SlidingWindowRateLimiter(max_requests=1, window_seconds=60),
+        ):
+            with TestClient(app) as client:
+                for _ in range(3):
+                    response = client.post(
+                        "/api/generate-sql",
+                        headers=self.headers,
+                        json={
+                            "db_id": 999_999,
+                            "natural_text": "list orders",
+                            "target_db_type": "mysql",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 404)
+
+    def test_generate_budget_is_refunded_after_dialect_mismatch(self) -> None:
+        import backend.main as main_module
+        from backend.rate_limit import SlidingWindowRateLimiter
+
+        with patch.object(
+            main_module,
+            "generate_limiter",
+            SlidingWindowRateLimiter(max_requests=1, window_seconds=60),
+        ), patch(
+            "backend.main.orchestrate_sql_generation", AsyncMock(return_value=_result())
+        ), patch("backend.rag._vector_search_available", return_value=False):
+            with TestClient(app) as client:
+                mismatch = client.post(
+                    "/api/generate-sql",
+                    headers=self.headers,
+                    json={
+                        "db_id": self.database["id"],
+                        "natural_text": "list orders",
+                        "target_db_type": "pg",
+                    },
+                )
+                valid = client.post(
+                    "/api/generate-sql",
+                    headers=self.headers,
+                    json={
+                        "db_id": self.database["id"],
+                        "natural_text": "list orders",
+                        "target_db_type": "mysql",
+                    },
+                )
+
+        self.assertEqual(mismatch.status_code, 400)
+        self.assertEqual(valid.status_code, 200)
 
 
 if __name__ == "__main__":

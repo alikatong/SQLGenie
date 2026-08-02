@@ -4,7 +4,13 @@ import unittest
 
 from pydantic import ValidationError
 
-from backend.schemas import GenerateSqlRequest, TableUpload, TableUploadRequest
+from backend.schemas import (
+    GenerateSqlRequest,
+    TableUpload,
+    TableUploadRequest,
+    UserCreateRequest,
+    UserPasswordResetRequest,
+)
 
 
 class RequestLimitTests(unittest.TestCase):
@@ -21,3 +27,13 @@ class RequestLimitTests(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             TableUploadRequest(tables=[table] * 101)
+
+    def test_rejects_multibyte_password_above_bcrypt_byte_limit(self) -> None:
+        with self.assertRaises(ValidationError):
+            UserCreateRequest(username="user", password="汉" * 25, role="user")
+        with self.assertRaises(ValidationError):
+            UserPasswordResetRequest(password="汉" * 25)
+
+    def test_accepts_password_at_exactly_seventy_two_utf8_bytes(self) -> None:
+        UserCreateRequest(username="user", password="汉" * 24, role="user")
+        UserPasswordResetRequest(password="汉" * 24)

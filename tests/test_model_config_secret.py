@@ -163,6 +163,49 @@ class ModelConfigSecretTests(unittest.TestCase):
             )
             self.assertEqual(get_model_runtime_config(connection)["api_key"], "first-secret")
 
+    def test_blank_embedding_model_path_preserves_existing_value(self) -> None:
+        with db_session() as connection:
+            view = update_model_config(
+                connection,
+                ConfigUpdate(
+                    base_url="https://example.test/v1",
+                    model_name="test-model",
+                    embedding_model_path="",
+                ),
+            )
+            runtime = get_model_runtime_config(connection)
+
+        self.assertEqual(runtime["embedding_model_path"], settings.rag_embedding_model)
+        self.assertEqual(view["embedding_model_path"], settings.rag_embedding_model)
+
+    def test_none_embedding_model_path_preserves_existing_value(self) -> None:
+        with db_session() as connection:
+            update_model_config(
+                connection,
+                ConfigUpdate(
+                    base_url="https://example.test/v1",
+                    model_name="test-model",
+                    embedding_model_path=None,
+                ),
+            )
+            runtime = get_model_runtime_config(connection)
+
+        self.assertEqual(runtime["embedding_model_path"], settings.rag_embedding_model)
+
+    def test_whitespace_embedding_model_path_preserves_existing_value(self) -> None:
+        with db_session() as connection:
+            update_model_config(
+                connection,
+                ConfigUpdate(
+                    base_url="https://example.test/v1",
+                    model_name="test-model",
+                    embedding_model_path="   ",
+                ),
+            )
+            runtime = get_model_runtime_config(connection)
+
+        self.assertEqual(runtime["embedding_model_path"], settings.rag_embedding_model)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -68,12 +68,15 @@ export function buildModelConfigPayload(form = {}) {
     thinking_timeout_seconds: normalizeTimeout(form.thinking_timeout_seconds),
     prompt_max_chars: normalizePromptMaxChars(form.prompt_max_chars),
     rag_top_k: normalizeRagTopK(form.rag_top_k),
-    embedding_model_path: String(form.embedding_model_path || '').trim(),
   }
   const newApiKey = String(form.api_key || '').trim()
+  const embeddingModelPath = String(form.embedding_model_path || '').trim()
 
   if (newApiKey) {
     payload.api_key = newApiKey
+  }
+  if (embeddingModelPath) {
+    payload.embedding_model_path = embeddingModelPath
   }
 
   return payload

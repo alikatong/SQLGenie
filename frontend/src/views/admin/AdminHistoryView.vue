@@ -61,6 +61,10 @@ async function loadHistory() {
 }
 
 async function loadUsers() {
+  if (!isAdmin.value) {
+    return
+  }
+
   try {
     users.value = await getUsers()
   } catch (error) {

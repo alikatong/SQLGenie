@@ -141,3 +141,27 @@ class AdminFeedbackRagApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_feedback_sync_receives_the_persisted_embedding_model_path(self) -> None:
+        with db_session() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_config (key, value, updated_at)
+                VALUES ('embedding_model_path', ?, 'now')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("custom-qwen-model",),
+            )
+
+        with patch("backend.main.sync_sql_feedback_rag_index") as sync_feedback:
+            with TestClient(app) as client:
+                response = client.post(
+                    f"/api/feedback-rag/examples/{self.feedback['id']}/approve",
+                    headers={"Authorization": f"Bearer {self.admin_token}"},
+                )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(
+            sync_feedback.call_args.kwargs["embedding_model_path"],
+            "custom-qwen-model",
+        )

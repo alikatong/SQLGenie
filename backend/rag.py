@@ -22,6 +22,10 @@ FEEDBACK_INDEX_VERSION = "feedback-v2-typed-cosine"
 EMBEDDING_PREPROCESSING_VERSION = "bge-query-instruction-v1"
 _SCHEMA_SYNC_LOCKS: dict[int, threading.RLock] = {}
 _SCHEMA_SYNC_LOCKS_GUARD = threading.Lock()
+_FEEDBACK_VALIDATION_CACHE_MAX = 4096
+_FEEDBACK_VALIDATION_CACHE: dict[tuple, bool] = {}
+_FEEDBACK_VALIDATION_CACHE_LOCK = threading.Lock()
+_CACHE_MISS = object()
 
 try:
     import chromadb
@@ -60,11 +64,17 @@ class _EmbeddingRuntime:
     def is_available(self) -> bool:
         return chromadb is not None and SentenceTransformer is not None
 
-    def encode(self, texts: list[str], *, kind: str = "document") -> list[list[float]]:
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        kind: str = "document",
+        model_path: str | None = None,
+    ) -> list[list[float]]:
         if not self.is_available():
             raise RuntimeError("Local vector dependencies are unavailable.")
 
-        model_name = settings.rag_embedding_model.strip()
+        model_name = _embedding_model_path(model_path)
         max_seq_length = int(settings.rag_embedding_max_seq_length)
         if (
             self._model is None
@@ -73,8 +83,8 @@ class _EmbeddingRuntime:
         ):
             self._model = SentenceTransformer(
                 model_name,
-                local_files_only=_prefer_local_model_files(),
-                trust_remote_code=_model_requires_remote_code(),
+                local_files_only=_prefer_local_model_files(model_name),
+                trust_remote_code=_model_requires_remote_code(model_name),
             )
             self._model.max_seq_length = min(
                 self._model.max_seq_length,
@@ -83,7 +93,10 @@ class _EmbeddingRuntime:
             self._model_name = model_name
             self._model_max_seq_length = max_seq_length
 
-        encoded_inputs = [_prepare_embedding_input(text, kind=kind) for text in texts]
+        encoded_inputs = [
+            _prepare_embedding_input(text, kind=kind, model_name=model_name)
+            for text in texts
+        ]
         vectors = self._model.encode(
             encoded_inputs,
             batch_size=settings.rag_embedding_batch_size,
@@ -93,24 +106,31 @@ class _EmbeddingRuntime:
 
 
 class _ChromaEmbeddingFunction:
+    def __init__(self, model_path: str | None = None) -> None:
+        self._model_path = model_path
+
     def __call__(self, input: list[str]) -> list[list[float]]:
-        return _EMBEDDING_RUNTIME.encode(list(input), kind="document")
+        return _EMBEDDING_RUNTIME.encode(list(input), kind="document", model_path=self._model_path)
 
     def name(self) -> str:
-        model_name = settings.rag_embedding_model.strip() or "embedding"
+        model_name = _embedding_model_path(self._model_path) or "embedding"
         return re.sub(r"[^a-zA-Z0-9_-]+", "_", model_name)
 
     def embed_documents(self, input: list[str]) -> list[list[float]]:
-        return _EMBEDDING_RUNTIME.encode(list(input), kind="document")
+        return _EMBEDDING_RUNTIME.encode(list(input), kind="document", model_path=self._model_path)
 
-    def embed_query(self, input: str | list[str]) -> list[list[float]] | list[float]:
-        if isinstance(input, str):
-            return _EMBEDDING_RUNTIME.encode([input], kind="query")[0]
-        return _EMBEDDING_RUNTIME.encode(list(input), kind="query")
+    def embed_query(self, input: str | list[str]) -> list[list[float]]:
+        # Chroma calls this with a list of query texts; accept a bare string
+        # for convenience but always return the list-of-vectors shape so the
+        # caller never has to special-case the container type.
+        return _EMBEDDING_RUNTIME.encode(
+            [input] if isinstance(input, str) else list(input),
+            kind="query",
+            model_path=self._model_path,
+        )
 
 
 _EMBEDDING_RUNTIME = _EmbeddingRuntime()
-_CHROMA_EMBEDDING_FUNCTION = _ChromaEmbeddingFunction()
 _CHROMA_CLIENT: Any = None
 
 
@@ -126,24 +146,32 @@ def _vector_search_available() -> bool:
     return _EMBEDDING_RUNTIME.is_available()
 
 
-def ensure_embedding_runtime() -> None:
+def _embedding_model_path(model_path: str | None) -> str:
+    return str(model_path or settings.rag_embedding_model).strip()
+
+
+def ensure_embedding_runtime(model_path: str | None = None) -> None:
     if not _vector_search_available():
         raise RuntimeError("Chroma 和 sentence-transformers 依赖不可用，无法初始化 Embedding RAG。")
-    _EMBEDDING_RUNTIME.encode(["SQLGenie Embedding RAG initialization preflight"], kind="document")
+    _EMBEDDING_RUNTIME.encode(
+        ["SQLGenie Embedding RAG initialization preflight"],
+        kind="document",
+        model_path=model_path,
+    )
 
 
-def _prefer_local_model_files() -> bool:
-    model_name = settings.rag_embedding_model.strip()
+def _prefer_local_model_files(model_name: str) -> bool:
+    model_name = model_name.strip()
     return bool(model_name) and (Path(model_name).exists() or Path(model_name).is_absolute())
 
 
-def _model_requires_remote_code() -> bool:
-    model_name = settings.rag_embedding_model.lower()
+def _model_requires_remote_code(model_name: str) -> bool:
+    model_name = model_name.lower()
     return "bge-m3" in model_name or "bge-large-zh" in model_name
 
 
-def _prepare_embedding_input(text: str, *, kind: str = "document") -> str:
-    model_name = settings.rag_embedding_model.lower()
+def _prepare_embedding_input(text: str, *, kind: str = "document", model_name: str | None = None) -> str:
+    model_name = _embedding_model_path(model_name).lower()
     if kind == "query" and "bge" in model_name:
         return f"Represent this sentence for searching relevant passages: {text}"
     return text
@@ -214,12 +242,13 @@ def _collection_metadata(
     db_id: int,
     index_version: str,
     content_fingerprint: str,
+    embedding_model: str | None = None,
 ) -> dict[str, Any]:
     return {
         "source": source,
         "db_id": db_id,
         "index_version": index_version,
-        "embedding_model": settings.rag_embedding_model.strip(),
+        "embedding_model": _embedding_model_path(embedding_model),
         "embedding_max_seq_length": int(settings.rag_embedding_max_seq_length),
         "preprocessing_version": EMBEDDING_PREPROCESSING_VERSION,
         "content_fingerprint": content_fingerprint,
@@ -495,7 +524,11 @@ def _persist_index_rows(connection: sqlite3.Connection, db_id: int, documents: l
         )
 
 
-def _collection_exists(db_id: int, documents: list[RagDocument]) -> bool:
+def _collection_exists(
+    db_id: int,
+    documents: list[RagDocument],
+    embedding_model_path: str | None = None,
+) -> bool:
     if not _vector_search_available():
         return False
 
@@ -503,7 +536,7 @@ def _collection_exists(db_id: int, documents: list[RagDocument]) -> bool:
         client = _get_chroma_client()
         collection = client.get_collection(
             name=_collection_name(db_id),
-            embedding_function=_CHROMA_EMBEDDING_FUNCTION,
+            embedding_function=_ChromaEmbeddingFunction(embedding_model_path),
         )
         metadata = collection.metadata or {}
         expected = _collection_metadata(
@@ -511,13 +544,18 @@ def _collection_exists(db_id: int, documents: list[RagDocument]) -> bool:
             db_id=db_id,
             index_version=SCHEMA_INDEX_VERSION,
             content_fingerprint=_documents_fingerprint(documents),
+            embedding_model=embedding_model_path,
         )
         return all(metadata.get(key) == value for key, value in expected.items())
     except Exception:
         return False
 
 
-def _replace_vector_collection(db_id: int, documents: list[RagDocument]) -> None:
+def _replace_vector_collection(
+    db_id: int,
+    documents: list[RagDocument],
+    embedding_model_path: str | None = None,
+) -> None:
     if not _vector_search_available():
         return
 
@@ -534,12 +572,13 @@ def _replace_vector_collection(db_id: int, documents: list[RagDocument]) -> None
 
     collection = client.get_or_create_collection(
         name=collection_name,
-        embedding_function=_CHROMA_EMBEDDING_FUNCTION,
+        embedding_function=_ChromaEmbeddingFunction(embedding_model_path),
         metadata=_collection_metadata(
             source="sqlgenie",
             db_id=db_id,
             index_version=SCHEMA_INDEX_VERSION,
             content_fingerprint=_documents_fingerprint(documents),
+            embedding_model=embedding_model_path,
         ),
     )
     collection.add(
@@ -562,6 +601,7 @@ def sync_schema_rag_index(
     schema_bundle: dict,
     force: bool = False,
     strict: bool = False,
+    embedding_model_path: str | None = None,
 ) -> list[dict]:
     db_id = int(schema_bundle["db_definition"]["id"])
     with _SCHEMA_SYNC_LOCKS_GUARD:
@@ -582,7 +622,10 @@ def sync_schema_rag_index(
             force
             or not existing_rows
             or existing_hashes != current_hashes
-            or (_vector_search_available() and not _collection_exists(db_id, documents))
+            or (
+                _vector_search_available()
+                and not _collection_exists(db_id, documents, embedding_model_path)
+            )
         )
         if not should_sync:
             return existing_rows
@@ -591,7 +634,7 @@ def sync_schema_rag_index(
         # End SQLite write transaction before embedding/Chroma work.
         connection.commit()
         try:
-            _replace_vector_collection(db_id, documents)
+            _replace_vector_collection(db_id, documents, embedding_model_path)
         except Exception:
             if strict:
                 raise
@@ -625,12 +668,37 @@ def delete_schema_rag_collection(db_id: int) -> None:
         logger.debug("Failed to delete Chroma collection for db_id=%s", db_id, exc_info=True)
 
 
+def _clear_feedback_validation_cache(db_id: int) -> None:
+    with _FEEDBACK_VALIDATION_CACHE_LOCK:
+        for key in [key for key in _FEEDBACK_VALIDATION_CACHE if key[0] == db_id]:
+            del _FEEDBACK_VALIDATION_CACHE[key]
+
+
+def _semantic_terms_fingerprint(connection: sqlite3.Connection, db_id: int) -> str:
+    rows = connection.execute(
+        """
+        SELECT id, db_id, term, synonyms_json, definition, category,
+               bindings_json, sql_hint, enabled, updated_at
+        FROM his_semantic_term
+        WHERE enabled = 1 AND (db_id = ? OR db_id IS NULL)
+        ORDER BY id
+        """,
+        (db_id,),
+    ).fetchall()
+    payload = [dict(row) for row in rows]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def sync_sql_feedback_rag_index(
     connection: sqlite3.Connection,
     db_id: int,
     *,
     strict: bool = False,
+    embedding_model_path: str | None = None,
 ) -> None:
+    _clear_feedback_validation_cache(db_id)
     rows = _load_sql_feedback_rows(connection, db_id)
     # Approval/update transaction must finish before local embedding work begins.
     connection.commit()
@@ -650,12 +718,13 @@ def sync_sql_feedback_rag_index(
 
         collection = client.get_or_create_collection(
             name=collection_name,
-            embedding_function=_CHROMA_EMBEDDING_FUNCTION,
+            embedding_function=_ChromaEmbeddingFunction(embedding_model_path),
             metadata=_collection_metadata(
                 source="sqlgenie_feedback",
                 db_id=db_id,
                 index_version=FEEDBACK_INDEX_VERSION,
                 content_fingerprint=_feedback_fingerprint(rows),
+                embedding_model=embedding_model_path,
             ),
         )
         collection.add(
@@ -679,16 +748,24 @@ def sync_sql_feedback_rag_index(
 def initialize_database_rag(
     connection: sqlite3.Connection,
     schema_bundle: dict,
+    embedding_model_path: str | None = None,
 ) -> dict[str, int]:
     """Rebuild schema and verified SQL vector indexes for one database."""
     from .config import validate_qwen_embedding_model_path
 
-    model_path = validate_qwen_embedding_model_path(settings.rag_embedding_model)
-    settings.rag_embedding_model = model_path
-    ensure_embedding_runtime()
+    model_path = validate_qwen_embedding_model_path(
+        embedding_model_path or settings.rag_embedding_model
+    )
+    ensure_embedding_runtime(model_path)
     db_id = int(schema_bundle["db_definition"]["id"])
-    sync_schema_rag_index(connection, schema_bundle=schema_bundle, force=True, strict=True)
-    sync_sql_feedback_rag_index(connection, db_id, strict=True)
+    sync_schema_rag_index(
+        connection,
+        schema_bundle=schema_bundle,
+        force=True,
+        strict=True,
+        embedding_model_path=model_path,
+    )
+    sync_sql_feedback_rag_index(connection, db_id, strict=True, embedding_model_path=model_path)
     return {
         "table_count": len(_load_index_rows(connection, db_id)),
         "feedback_example_count": len(_load_sql_feedback_rows(connection, db_id)),
@@ -696,6 +773,7 @@ def initialize_database_rag(
 
 
 def delete_sql_feedback_rag_index(db_id: int) -> None:
+    _clear_feedback_validation_cache(db_id)
     if not _vector_search_available():
         return
 
@@ -939,11 +1017,34 @@ def _load_sql_feedback_rows(connection: sqlite3.Connection, db_id: int) -> list[
         (db_id,),
     )
     schema_bundle = _load_schema_bundle_for_policy(connection, db_id)
+    schema_fingerprint = _schema_rows_fingerprint(_load_index_rows(connection, db_id))
+    semantic_fingerprint = _semantic_terms_fingerprint(connection, db_id)
+    validation_settings = (
+        int(settings.his_term_top_k),
+        int(settings.rag_min_keyword_hits),
+        float(settings.rag_min_keyword_score),
+    )
     valid_rows: list[dict] = []
     for raw_row in cursor.fetchall():
         row = dict(raw_row)
-        valid, _ = validate_feedback_for_rag(connection, row, schema_bundle=schema_bundle)
-        if valid:
+        cache_key = (
+            db_id,
+            schema_fingerprint,
+            semantic_fingerprint,
+            validation_settings,
+            int(row["id"]),
+            _feedback_content_hash(row),
+        )
+        with _FEEDBACK_VALIDATION_CACHE_LOCK:
+            cached_valid = _FEEDBACK_VALIDATION_CACHE.get(cache_key, _CACHE_MISS)
+        if cached_valid is _CACHE_MISS:
+            valid, _ = validate_feedback_for_rag(connection, row, schema_bundle=schema_bundle)
+            with _FEEDBACK_VALIDATION_CACHE_LOCK:
+                if len(_FEEDBACK_VALIDATION_CACHE) >= _FEEDBACK_VALIDATION_CACHE_MAX:
+                    _FEEDBACK_VALIDATION_CACHE.clear()
+                _FEEDBACK_VALIDATION_CACHE[cache_key] = valid
+            cached_valid = valid
+        if cached_valid:
             valid_rows.append(row)
     return valid_rows
 
@@ -986,6 +1087,7 @@ def _vector_feedback_recall(
     target_db_type: str,
     limit: int,
     db_id: int,
+    embedding_model_path: str | None = None,
 ) -> list[dict]:
     if not _vector_search_available():
         return []
@@ -993,7 +1095,7 @@ def _vector_feedback_recall(
     try:
         collection = _get_chroma_client().get_collection(
             name=_feedback_collection_name(db_id),
-            embedding_function=_CHROMA_EMBEDDING_FUNCTION,
+            embedding_function=_ChromaEmbeddingFunction(embedding_model_path),
         )
         result = collection.query(
             query_texts=[question],
@@ -1010,6 +1112,7 @@ def _vector_feedback_recall(
         db_id=db_id,
         index_version=FEEDBACK_INDEX_VERSION,
         content_fingerprint=_feedback_fingerprint(list(rows_by_id.values())),
+        embedding_model=embedding_model_path,
     )
     metadata = collection.metadata or {}
     if not all(metadata.get(key) == value for key, value in expected_metadata.items()):
@@ -1052,6 +1155,7 @@ def retrieve_sql_feedback_context(
     question: str,
     target_db_type: str,
     top_k: int = 3,
+    embedding_model_path: str | None = None,
 ) -> dict[str, Any]:
     rows = [
         row
@@ -1063,7 +1167,14 @@ def retrieve_sql_feedback_context(
 
     limit = min(max(top_k, 1), len(rows))
     rows_by_id = {int(row["id"]): row for row in rows}
-    vector_hits = _vector_feedback_recall(rows_by_id, question, target_db_type, limit, db_id)
+    vector_hits = _vector_feedback_recall(
+        rows_by_id,
+        question,
+        target_db_type,
+        limit,
+        db_id,
+        embedding_model_path=embedding_model_path,
+    )
     keyword_hits = _keyword_feedback_recall(rows, question, limit)
 
     candidates: dict[int, dict[str, Any]] = {}
@@ -1135,20 +1246,27 @@ def _append_unique_rows(
     return appended
 
 
-def _vector_recall(rows_by_table: dict[str, dict], question: str, limit: int, db_id: int) -> list[dict]:
+def _vector_recall(
+    rows_by_table: dict[str, dict],
+    question: str,
+    limit: int,
+    db_id: int,
+    embedding_model_path: str | None = None,
+) -> list[dict]:
     if not _vector_search_available():
         return []
 
     try:
         collection = _get_chroma_client().get_collection(
             name=_collection_name(db_id),
-            embedding_function=_CHROMA_EMBEDDING_FUNCTION,
+            embedding_function=_ChromaEmbeddingFunction(embedding_model_path),
         )
         expected_metadata = _collection_metadata(
             source="sqlgenie",
             db_id=db_id,
             index_version=SCHEMA_INDEX_VERSION,
             content_fingerprint=_schema_rows_fingerprint(list(rows_by_table.values())),
+            embedding_model=embedding_model_path,
         )
         metadata = collection.metadata or {}
         if not all(metadata.get(key) == value for key, value in expected_metadata.items()):
@@ -1419,9 +1537,14 @@ def retrieve_schema_context(
     term_columns: dict[str, list[str]] | None = None,
     explicit_tables: list[str] | tuple[str, ...] = (),
     explicit_columns: list[str] | tuple[str, ...] = (),
+    embedding_model_path: str | None = None,
 ) -> dict[str, Any]:
     db_id = int(schema_bundle["db_definition"]["id"])
-    rows = sync_schema_rag_index(connection, schema_bundle=schema_bundle)
+    rows = sync_schema_rag_index(
+        connection,
+        schema_bundle=schema_bundle,
+        embedding_model_path=embedding_model_path,
+    )
     if not rows:
         return {
             "operation": "SELECT",
@@ -1443,7 +1566,13 @@ def retrieve_schema_context(
     for name, row in rows_by_table.items():
         row["_schema_columns"] = schema_tables.get(name, {}).get("columns", [])
 
-    vector_hits = _vector_recall(rows_by_table, question, limit, db_id)
+    vector_hits = _vector_recall(
+        rows_by_table,
+        question,
+        limit,
+        db_id,
+        embedding_model_path=embedding_model_path,
+    )
     keyword_hits = _keyword_recall(rows, question, limit)
 
     evidence_by_table: dict[str, dict[str, Any]] = {

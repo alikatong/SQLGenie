@@ -92,7 +92,12 @@ class EmbeddingRagApiTests(unittest.TestCase):
     def test_admin_can_initialize_all_database_rag_indexes(self) -> None:
         initialized: list[int] = []
 
-        def fake_initialize(_connection, schema_bundle: dict) -> dict[str, int]:
+        def fake_initialize(
+            _connection,
+            schema_bundle: dict,
+            *,
+            embedding_model_path: str | None = None,
+        ) -> dict[str, int]:
             db_id = int(schema_bundle["db_definition"]["id"])
             initialized.append(db_id)
             return {"table_count": 1, "feedback_example_count": 2}

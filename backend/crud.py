@@ -74,7 +74,13 @@ def _sync_rag_and_return_schema(connection: sqlite3.Connection, db_id: int) -> d
     schema = get_table_schema(connection, db_id)
     schema_bundle = get_schema_bundle(connection, db_id)
     if schema_bundle is not None:
-        sync_schema_rag_index(connection, schema_bundle=schema_bundle, force=True)
+        runtime = get_model_runtime_config(connection)
+        sync_schema_rag_index(
+            connection,
+            schema_bundle=schema_bundle,
+            force=True,
+            embedding_model_path=str(runtime["embedding_model_path"]),
+        )
     else:
         delete_schema_rag_index(connection, db_id)
     return schema
@@ -719,7 +725,6 @@ def get_model_runtime_config(connection: sqlite3.Connection) -> dict[str, str | 
     config["embedding_model_path"] = embedding_model_path
     config["rag_embedding_model"] = embedding_model_path
     config["rag_expand_depth"] = settings.rag_expand_depth
-    settings.rag_embedding_model = embedding_model_path
     return config
 
 
@@ -899,7 +904,14 @@ def update_model_config(connection: sqlite3.Connection, payload: ConfigUpdate) -
         ("prompt_max_chars", str(payload.prompt_max_chars)),
         ("rag_top_k", str(payload.rag_top_k)),
     ]
-    if "embedding_model_path" in payload.model_fields_set:
+    # A blank/null path means "keep the existing value": the frontend only
+    # sends this field when the admin actually picked a directory, and a
+    # pre-existing path must never be wiped by an unrelated config save.
+    if (
+        "embedding_model_path" in payload.model_fields_set
+        and payload.embedding_model_path
+        and payload.embedding_model_path.strip()
+    ):
         embedding_model_path = validate_qwen_embedding_model_path(payload.embedding_model_path)
         values.append(("embedding_model_path", embedding_model_path))
     # Keep this optional field merge-compatible with older clients that do not
