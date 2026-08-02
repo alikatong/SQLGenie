@@ -120,6 +120,15 @@ class EmbeddingRagApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_non_admin_cannot_open_embedding_model_picker(self) -> None:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/embedding-models/pick-directory",
+                headers={"Authorization": f"Bearer {self.user_token}"},
+            )
+
+        self.assertEqual(response.status_code, 403)
+
     def test_invalid_embedding_model_path_returns_bad_request(self) -> None:
         with TestClient(app) as client:
             response = client.put(
@@ -134,6 +143,45 @@ class EmbeddingRagApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"]["code"], "INVALID_EMBEDDING_MODEL")
+
+    def test_admin_can_choose_embedding_model_directory(self) -> None:
+        with patch("backend.main.pick_qwen_embedding_model_path", return_value=str(self.model_path)) as picker:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/embedding-models/pick-directory",
+                    headers={"Authorization": f"Bearer {self.admin_token}"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["selected"])
+        self.assertEqual(response.json()["embedding_model_path"], str(self.model_path))
+        picker.assert_called_once()
+
+    def test_cancelled_directory_selection_keeps_current_path(self) -> None:
+        with patch("backend.main.pick_qwen_embedding_model_path", return_value=None):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/embedding-models/pick-directory",
+                    headers={"Authorization": f"Bearer {self.admin_token}"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["selected"])
+        self.assertEqual(response.json()["embedding_model_path"], str(self.model_path))
+
+    def test_directory_picker_failure_returns_service_error(self) -> None:
+        with patch(
+            "backend.main.pick_qwen_embedding_model_path",
+            side_effect=RuntimeError("native picker unavailable"),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/embedding-models/pick-directory",
+                    headers={"Authorization": f"Bearer {self.admin_token}"},
+                )
+
+        self.assertEqual(response.status_code, 501)
+        self.assertEqual(response.json()["detail"]["code"], "MODEL_DIRECTORY_PICKER_UNAVAILABLE")
 
 
 if __name__ == "__main__":

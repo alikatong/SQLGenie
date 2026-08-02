@@ -128,6 +128,12 @@ export function updateConfig(payload) {
   return apiClient.put('/config', payload).then((response) => response.data)
 }
 
+export function pickEmbeddingModelDirectory() {
+  return apiClient
+    .post('/embedding-models/pick-directory', null, { timeout: 30 * 60 * 1000 })
+    .then((response) => response.data)
+}
+
 export function initializeEmbeddingRag() {
   return apiClient
     .post('/embedding-rag/initialize', null, { timeout: 30 * 60 * 1000 })

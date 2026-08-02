@@ -1,7 +1,12 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getConfig, initializeEmbeddingRag, updateConfig } from '../../api'
+import {
+  getConfig,
+  initializeEmbeddingRag,
+  pickEmbeddingModelDirectory,
+  updateConfig,
+} from '../../api'
 import { extractError } from '../../utils/errors'
 import { buildModelConfigPayload, mapModelConfigResponse } from '../../utils/modelConfig'
 
@@ -11,6 +16,7 @@ defineOptions({
 
 const loading = ref(false)
 const saving = ref(false)
+const selectingEmbeddingModel = ref(false)
 const initializingEmbedding = ref(false)
 const initializationResult = ref(null)
 const initializationSummary = computed(() => {
@@ -59,27 +65,27 @@ async function loadConfig() {
 async function saveConfig() {
   if (!form.base_url.trim() || !form.model_name.trim()) {
     ElMessage.warning('请完整填写 Base URL 和模型名。')
-    return
+    return false
   }
 
   if (!secret.configured && !form.api_key.trim()) {
     ElMessage.warning('当前尚未配置 API Key，请输入新密钥。')
-    return
+    return false
   }
 
   if (!Number.isFinite(form.thinking_timeout_seconds) || form.thinking_timeout_seconds < 10) {
     ElMessage.warning('最大等待秒数不能小于 10 秒。')
-    return
+    return false
   }
 
   if (!Number.isFinite(form.rag_top_k) || form.rag_top_k < 1 || form.rag_top_k > 20) {
     ElMessage.warning('Schema 检索 Top K 必须在 1 到 20 之间。')
-    return
+    return false
   }
 
   if (!Number.isFinite(form.prompt_max_chars) || form.prompt_max_chars < 1000 || form.prompt_max_chars > 120000) {
     ElMessage.warning('模型上下文上限必须在 1000 到 120000 字符之间。')
-    return
+    return false
   }
 
   saving.value = true
@@ -91,10 +97,27 @@ async function saveConfig() {
     Object.assign(secret, mapped.secret)
     Object.assign(retrieval, mapped.retrieval)
     ElMessage.success('系统配置已保存。')
+    return true
   } catch (error) {
     ElMessage.error(extractError(error, '保存系统配置失败。'))
+    return false
   } finally {
     saving.value = false
+  }
+}
+
+async function chooseEmbeddingModelDirectory() {
+  selectingEmbeddingModel.value = true
+  try {
+    const result = await pickEmbeddingModelDirectory()
+    if (result.selected && result.embedding_model_path) {
+      form.embedding_model_path = result.embedding_model_path
+      ElMessage.success('Qwen Embedding 模型目录已选择，请保存配置。')
+    }
+  } catch (error) {
+    ElMessage.error(extractError(error, '选择 Embedding 模型目录失败。'))
+  } finally {
+    selectingEmbeddingModel.value = false
   }
 }
 
@@ -102,6 +125,13 @@ async function initializeEmbedding() {
   if (!form.embedding_model_path.trim()) {
     ElMessage.warning('请先填写 Qwen Embedding 模型本地目录。')
     return
+  }
+
+  if (form.embedding_model_path.trim() !== retrieval.embeddingModel.trim()) {
+    const saved = await saveConfig()
+    if (!saved) {
+      return
+    }
   }
 
   initializingEmbedding.value = true
@@ -167,13 +197,24 @@ onMounted(loadConfig)
           </el-form-item>
 
           <el-form-item label="Qwen Embedding 模型本地目录">
-            <el-input
-              v-model="form.embedding_model_path"
-              placeholder="例如：E:\\models\\Qwen3-Embedding-0.6B"
-              clearable
-            />
+            <div class="embedding-path-picker">
+              <el-input
+                v-model="form.embedding_model_path"
+                readonly
+                placeholder="点击右侧按钮选择 Qwen 模型目录"
+              />
+              <el-button
+                type="primary"
+                plain
+                :loading="selectingEmbeddingModel"
+                :disabled="saving || loading || initializingEmbedding"
+                @click="chooseEmbeddingModelDirectory"
+              >
+                选择目录
+              </el-button>
+            </div>
             <div class="field-help">
-              仅支持本地 Qwen Embedding 模型目录；目录需要包含 SentenceTransformers 所需文件和 config.json。
+              点击后打开本机系统目录选择器；仅支持包含 SentenceTransformers 文件和 config.json 的 Qwen 模型目录。
             </div>
           </el-form-item>
 
@@ -312,6 +353,13 @@ onMounted(loadConfig)
   width: 100%;
 }
 
+.embedding-path-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  width: 100%;
+}
+
 .secret-status,
 .retrieval-config {
   display: flex;
@@ -363,6 +411,10 @@ onMounted(loadConfig)
 
 @media (max-width: 720px) {
   .secret-field {
+    grid-template-columns: 1fr;
+  }
+
+  .embedding-path-picker {
     grid-template-columns: 1fr;
   }
 

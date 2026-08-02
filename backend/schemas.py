@@ -350,6 +350,12 @@ class ConfigUpdate(BaseModel):
     embedding_model_path: str | None = Field(default=None, max_length=2000)
 
 
+class EmbeddingModelDirectorySelectionResponse(BaseModel):
+    selected: bool = False
+    embedding_model_path: str = ""
+    embedding_model_family: Literal["Qwen"] = "Qwen"
+
+
 class EmbeddingRagDatabaseResult(BaseModel):
     db_id: int
     name: str

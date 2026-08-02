@@ -55,6 +55,7 @@ from .crud import (
     update_model_config,
 )
 from .database import db_session, init_db
+from .embedding_model_picker import pick_qwen_embedding_model_path
 from .generation import GenerationError, orchestrate_sql_generation
 from .his_semantics import retrieve_his_semantics
 from .intent import analyze_intent
@@ -77,6 +78,7 @@ from .schemas import (
     FeedbackRagExamplePageResponse,
     FeedbackRagExampleQuery,
     EmbeddingRagInitializationResponse,
+    EmbeddingModelDirectorySelectionResponse,
     GenerateSqlRequest,
     GenerateSqlResponse,
     HisSemanticTermCreate,
@@ -772,6 +774,37 @@ def save_config(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_EMBEDDING_MODEL", "message": str(exc)},
         ) from exc
+
+
+@app.post(
+    "/api/embedding-models/pick-directory",
+    response_model=EmbeddingModelDirectorySelectionResponse,
+)
+def pick_embedding_model_directory(
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> dict[str, str | bool]:
+    with db_session() as connection:
+        runtime = get_model_runtime_config(connection)
+    current_path = str(runtime.get("embedding_model_path") or "")
+
+    try:
+        selected_path = pick_qwen_embedding_model_path(current_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_EMBEDDING_MODEL", "message": str(exc)},
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"code": "MODEL_DIRECTORY_PICKER_UNAVAILABLE", "message": str(exc)},
+        ) from exc
+
+    return {
+        "selected": selected_path is not None,
+        "embedding_model_path": selected_path or current_path,
+        "embedding_model_family": "Qwen",
+    }
 
 
 @app.post(
