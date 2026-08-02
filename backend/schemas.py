@@ -136,6 +136,104 @@ class GenerateSqlResponse(BaseModel):
     retrieved_tables: list[str] = Field(default_factory=list)
     retrieval_mode: str = "unknown"
     history_id: int
+    request_id: str = ""
+    prompt_version: str = ""
+    policy_version: str = ""
+    no_sql_code: str = ""
+    validation_status: Literal["passed", "failed", "not_run"] = "not_run"
+    validation_errors: list["ValidationIssue"] = Field(default_factory=list)
+    warnings: list["ValidationIssue"] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    retrieved_evidence: list["RetrievalEvidence"] = Field(default_factory=list)
+    retrieved_terms: list["RetrievedTerm"] = Field(default_factory=list)
+    model_calls: int = Field(default=0, ge=0, le=2)
+
+
+class ValidationIssue(BaseModel):
+    code: str
+    message: str
+
+
+class RetrievalEvidence(BaseModel):
+    table_name: str
+    reasons: list[str] = Field(default_factory=list)
+    keyword_score: float = 0.0
+    vector_similarity: float | None = None
+    vector_margin: float | None = None
+    evidence_score: float = 0.0
+    matched_columns: list[str] = Field(default_factory=list)
+    matched_terms: list[str] = Field(default_factory=list)
+    join_path: list[dict[str, str]] = Field(default_factory=list)
+    expanded_from: str | None = None
+
+
+class RetrievedTerm(BaseModel):
+    id: int
+    term: str
+    category: str
+    scope: str
+    score: float
+
+
+class HisSemanticBinding(BaseModel):
+    table: str = Field(..., min_length=1, max_length=100)
+    columns: list[str] = Field(default_factory=list, max_length=50)
+    role: str | None = Field(default=None, max_length=100)
+
+
+class HisSemanticTermBase(BaseModel):
+    db_id: int | None = Field(default=None, gt=0)
+    term: str = Field(..., min_length=1, max_length=100)
+    synonyms: list[str] = Field(default_factory=list, max_length=20)
+    definition: str = Field(..., min_length=1, max_length=2000)
+    category: Literal["entity", "event", "time", "status", "metric", "relation"]
+    bindings: list[HisSemanticBinding] = Field(default_factory=list, max_length=20)
+    sql_hint: str = Field(default="", max_length=2000)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_synonyms(self) -> "HisSemanticTermBase":
+        normalized: set[str] = set()
+        for synonym in self.synonyms:
+            value = synonym.strip()
+            if not value or len(value) > 100:
+                raise ValueError("同义词必须为 1-100 个字符。")
+            key = value.casefold()
+            if key in normalized:
+                raise ValueError("同义词不能重复。")
+            normalized.add(key)
+        return self
+
+
+class HisSemanticTermCreate(HisSemanticTermBase):
+    pass
+
+
+class HisSemanticTermUpdate(HisSemanticTermBase):
+    pass
+
+
+class HisSemanticTermOut(HisSemanticTermBase):
+    id: int
+    created_by: int
+    created_at: str
+    updated_at: str
+
+
+class HisSemanticTermQuery(BaseModel):
+    db_id: int | None = Field(default=None, gt=0)
+    enabled: bool | None = None
+    category: Literal["entity", "event", "time", "status", "metric", "relation"] | None = None
+    search: str = Field(default="", max_length=100)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class HisSemanticTermPageResponse(BaseModel):
+    items: list[HisSemanticTermOut] = Field(default_factory=list)
+    total: int
+    page: int
+    page_size: int
 
 
 class SqlFeedbackSubmit(BaseModel):
@@ -225,19 +323,50 @@ class SqlHistoryPageResponse(BaseModel):
 
 
 class ConfigView(BaseModel):
-    api_key: str = ""
+    api_key_configured: bool = False
+    api_key_last4: str = ""
     base_url: str = ""
     model_name: str = ""
     enable_thinking: bool = True
-    thinking_timeout_seconds: int = 120
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    thinking_timeout_seconds: int = 600
+    prompt_max_chars: int = 60_000
     rag_embedding_model: str = ""
-    rag_top_k: int = 30
+    embedding_model_path: str = ""
+    embedding_model_family: Literal["Qwen"] = "Qwen"
+    rag_top_k: int = 8
     rag_expand_depth: int = 1
 
 
 class ConfigUpdate(BaseModel):
-    api_key: str = Field(..., min_length=1)
+    api_key: str | None = Field(default=None, max_length=10000)
     base_url: str = Field(..., min_length=1)
     model_name: str = Field(..., min_length=1)
     enable_thinking: bool = True
-    thinking_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    thinking_timeout_seconds: int = Field(default=600, ge=10, le=600)
+    prompt_max_chars: int = Field(default=60_000, ge=1_000, le=120_000)
+    rag_top_k: int = Field(default=8, ge=1, le=20)
+    embedding_model_path: str | None = Field(default=None, max_length=2000)
+
+
+class EmbeddingRagDatabaseResult(BaseModel):
+    db_id: int
+    name: str
+    table_count: int = Field(default=0, ge=0)
+    feedback_example_count: int = Field(default=0, ge=0)
+    error: str = ""
+
+
+class EmbeddingRagInitializationResponse(BaseModel):
+    embedding_model_path: str
+    embedding_model_family: Literal["Qwen"] = "Qwen"
+    database_count: int = Field(default=0, ge=0)
+    schema_table_count: int = Field(default=0, ge=0)
+    feedback_example_count: int = Field(default=0, ge=0)
+    initialized_databases: list[EmbeddingRagDatabaseResult] = Field(default_factory=list)
+    failed_databases: list[EmbeddingRagDatabaseResult] = Field(default_factory=list)
+    duration_ms: int = Field(default=0, ge=0)
+
+
+GenerateSqlResponse.model_rebuild()

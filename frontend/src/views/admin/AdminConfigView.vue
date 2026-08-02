@@ -1,8 +1,9 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getConfig, updateConfig } from '../../api'
+import { getConfig, initializeEmbeddingRag, updateConfig } from '../../api'
 import { extractError } from '../../utils/errors'
+import { buildModelConfigPayload, mapModelConfigResponse } from '../../utils/modelConfig'
 
 defineOptions({
   name: 'AdminConfigView',
@@ -10,24 +11,44 @@ defineOptions({
 
 const loading = ref(false)
 const saving = ref(false)
+const initializingEmbedding = ref(false)
+const initializationResult = ref(null)
+const initializationSummary = computed(() => {
+  const result = initializationResult.value
+  if (!result) {
+    return ''
+  }
+  return `Processed ${result.database_count ?? 0} databases, ${result.schema_table_count ?? 0} schema tables, and ${result.feedback_example_count ?? 0} verified SQL examples.`
+})
+const secret = reactive({
+  configured: false,
+  last4: '',
+})
+const retrieval = reactive({
+  embeddingModel: '',
+  expandDepth: null,
+})
 
 const form = reactive({
   api_key: '',
   base_url: '',
   model_name: '',
   enable_thinking: true,
-  thinking_timeout_seconds: 120,
+  reasoning_effort: null,
+  thinking_timeout_seconds: 600,
+  prompt_max_chars: 60000,
+  rag_top_k: 8,
+  embedding_model_path: '',
 })
 
 async function loadConfig() {
   loading.value = true
   try {
     const data = await getConfig()
-    form.api_key = data.api_key || ''
-    form.base_url = data.base_url || ''
-    form.model_name = data.model_name || ''
-    form.enable_thinking = data.enable_thinking ?? true
-    form.thinking_timeout_seconds = Number(data.thinking_timeout_seconds || 120)
+    const mapped = mapModelConfigResponse(data)
+    Object.assign(form, mapped.form)
+    Object.assign(secret, mapped.secret)
+    Object.assign(retrieval, mapped.retrieval)
   } catch (error) {
     ElMessage.error(extractError(error, '加载系统配置失败。'))
   } finally {
@@ -36,8 +57,13 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  if (!form.api_key.trim() || !form.base_url.trim() || !form.model_name.trim()) {
-    ElMessage.warning('请完整填写 API Key、Base URL 和模型名。')
+  if (!form.base_url.trim() || !form.model_name.trim()) {
+    ElMessage.warning('请完整填写 Base URL 和模型名。')
+    return
+  }
+
+  if (!secret.configured && !form.api_key.trim()) {
+    ElMessage.warning('当前尚未配置 API Key，请输入新密钥。')
     return
   }
 
@@ -46,20 +72,52 @@ async function saveConfig() {
     return
   }
 
+  if (!Number.isFinite(form.rag_top_k) || form.rag_top_k < 1 || form.rag_top_k > 20) {
+    ElMessage.warning('Schema 检索 Top K 必须在 1 到 20 之间。')
+    return
+  }
+
+  if (!Number.isFinite(form.prompt_max_chars) || form.prompt_max_chars < 1000 || form.prompt_max_chars > 120000) {
+    ElMessage.warning('模型上下文上限必须在 1000 到 120000 字符之间。')
+    return
+  }
+
   saving.value = true
   try {
-    await updateConfig({
-      api_key: form.api_key.trim(),
-      base_url: form.base_url.trim(),
-      model_name: form.model_name.trim(),
-      enable_thinking: form.enable_thinking,
-      thinking_timeout_seconds: Math.trunc(form.thinking_timeout_seconds),
-    })
+    const payload = buildModelConfigPayload(form)
+    const data = await updateConfig(payload)
+    const mapped = mapModelConfigResponse(data, { reasoning_effort: payload.reasoning_effort })
+    Object.assign(form, mapped.form)
+    Object.assign(secret, mapped.secret)
+    Object.assign(retrieval, mapped.retrieval)
     ElMessage.success('系统配置已保存。')
   } catch (error) {
     ElMessage.error(extractError(error, '保存系统配置失败。'))
   } finally {
     saving.value = false
+  }
+}
+
+async function initializeEmbedding() {
+  if (!form.embedding_model_path.trim()) {
+    ElMessage.warning('请先填写 Qwen Embedding 模型本地目录。')
+    return
+  }
+
+  initializingEmbedding.value = true
+  initializationResult.value = null
+  try {
+    const result = await initializeEmbeddingRag()
+    initializationResult.value = result
+    if (result.failed_databases?.length) {
+      ElMessage.warning(`Embedding 初始化完成，但有 ${result.failed_databases.length} 个数据库失败。`)
+    } else {
+      ElMessage.success('Embedding RAG 初始化完成。')
+    }
+  } catch (error) {
+    ElMessage.error(extractError(error, 'Embedding RAG 初始化失败。'))
+  } finally {
+    initializingEmbedding.value = false
   }
 }
 
@@ -73,7 +131,7 @@ onMounted(loadConfig)
         <div class="section-header">
           <div>
             <h2>大模型配置</h2>
-            <p>配置 OpenAI 兼容接口参数，并控制 SQL 生成时是否启用深度思考以及最长等待时间。</p>
+            <p>配置 OpenAI 兼容接口；候选 SQL 先经本地校验，失败时可自动修复一次。</p>
           </div>
         </div>
       </template>
@@ -88,12 +146,35 @@ onMounted(loadConfig)
       <div class="config-form">
         <el-form label-position="top">
           <el-form-item label="API Key">
+            <div class="secret-field">
+              <el-input
+                v-model="form.api_key"
+                type="password"
+                show-password
+                autocomplete="new-password"
+                placeholder="留空表示不更换现有密钥"
+              />
+              <div class="secret-status" aria-live="polite">
+                <el-tag :type="secret.configured ? 'success' : 'warning'">
+                  {{ secret.configured ? '已配置' : '未配置' }}
+                </el-tag>
+                <span v-if="secret.configured && secret.last4" class="muted-text">
+                  尾四位：{{ secret.last4 }}
+                </span>
+              </div>
+            </div>
+            <div class="field-help">系统不会回显现有密钥；状态和尾四位不会写入输入框或保存载荷。</div>
+          </el-form-item>
+
+          <el-form-item label="Qwen Embedding 模型本地目录">
             <el-input
-              v-model="form.api_key"
-              type="password"
-              show-password
-              placeholder="请输入 OpenAI 兼容接口的 API Key"
+              v-model="form.embedding_model_path"
+              placeholder="例如：E:\\models\\Qwen3-Embedding-0.6B"
+              clearable
             />
+            <div class="field-help">
+              仅支持本地 Qwen Embedding 模型目录；目录需要包含 SentenceTransformers 所需文件和 config.json。
+            </div>
           </el-form-item>
 
           <el-form-item label="Base URL">
@@ -110,10 +191,58 @@ onMounted(loadConfig)
             />
           </el-form-item>
 
-          <el-form-item label="启用深度思考">
+          <el-form-item label="校验失败后自动修复">
             <div class="thinking-row">
               <el-switch v-model="form.enable_thinking" />
-              <span class="muted-text">开启后会先生成，再做一次审核修正，通常更准，但更慢。</span>
+              <span class="muted-text">开启后，仅当本地校验失败时调用同一远端模型修复一次。</span>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="模型思考强度">
+            <el-select
+              v-model="form.reasoning_effort"
+              clearable
+              placeholder="跟随模型（未设置）"
+              style="width: 220px"
+            >
+              <el-option label="Low" value="low" />
+              <el-option label="Medium" value="medium" />
+              <el-option label="High" value="high" />
+              <el-option label="XHigh" value="xhigh" />
+              <el-option label="Max" value="max" />
+            </el-select>
+            <div class="field-help">仅对支持 reasoning_effort 的模型发送；未设置时保持兼容请求格式。</div>
+          </el-form-item>
+
+          <div v-if="retrieval.embeddingModel || retrieval.expandDepth !== null" class="retrieval-config">
+            <strong>Schema 检索运行参数</strong>
+            <span v-if="retrieval.embeddingModel">Embedding：{{ retrieval.embeddingModel }}</span>
+            <span v-if="retrieval.expandDepth !== null">关系扩展深度：{{ retrieval.expandDepth }}</span>
+          </div>
+
+          <el-form-item label="Schema 检索 Top K">
+            <div class="thinking-row">
+              <el-input-number
+                v-model="form.rag_top_k"
+                :min="1"
+                :max="20"
+                :step="1"
+                :precision="0"
+              />
+              <span class="muted-text">控制每次请求进入模型上下文的 Schema 候选表数量。</span>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="模型上下文上限（字符）">
+            <div class="thinking-row">
+              <el-input-number
+                v-model="form.prompt_max_chars"
+                :min="1000"
+                :max="120000"
+                :step="1000"
+                :precision="0"
+              />
+              <span class="muted-text">默认 60000；超过预算时会优先移除低优先级 Schema 候选表。</span>
             </div>
           </el-form-item>
 
@@ -129,6 +258,30 @@ onMounted(loadConfig)
               <span class="muted-text">超过这个时间仍未返回时，系统会明确提示为超时。</span>
             </div>
           </el-form-item>
+
+          <div class="embedding-actions">
+            <div>
+              <strong>Schema / 正确 SQL RAG</strong>
+              <span class="muted-text">
+                使用当前 Qwen 模型重建所有数据库的 Schema 和已审核 SQL 向量索引。
+              </span>
+            </div>
+            <el-button
+              type="success"
+              :loading="initializingEmbedding"
+              :disabled="saving || loading"
+              @click="initializeEmbedding"
+            >
+              初始化 Embedding
+            </el-button>
+          </div>
+          <el-alert
+            v-if="initializationResult"
+            class="embedding-result"
+            type="success"
+            :closable="false"
+            :title="initializationSummary"
+          />
 
           <div class="config-actions">
             <el-button @click="loadConfig" :loading="loading">重新加载</el-button>
@@ -152,9 +305,79 @@ onMounted(loadConfig)
   flex-wrap: wrap;
 }
 
+.secret-field {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  gap: 12px;
+  width: 100%;
+}
+
+.secret-status,
+.retrieval-config {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.field-help {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 0.86rem;
+}
+
+.retrieval-config {
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.82);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
 .config-actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.embedding-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--card-border);
+}
+
+.embedding-actions > div {
+  display: grid;
+  gap: 6px;
+}
+
+.embedding-result {
+  margin-top: 14px;
+}
+
+@media (max-width: 720px) {
+  .secret-field {
+    grid-template-columns: 1fr;
+  }
+
+  .config-actions {
+    justify-content: stretch;
+  }
+
+  .config-actions :deep(.el-button) {
+    flex: 1;
+    margin-left: 0;
+  }
+
+  .embedding-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 </style>

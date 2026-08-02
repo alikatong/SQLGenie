@@ -24,8 +24,8 @@ if not exist "%PYTHON_EXE%" (
   exit /b 1
 )
 
-if not exist "%BACKEND_STARTER_VBS%" (
-  echo [sqlGenie] Missing %BACKEND_STARTER_VBS%
+if not exist "%BACKEND_STARTER%" (
+  echo [sqlGenie] Missing %BACKEND_STARTER%
   exit /b 1
 )
 
@@ -48,7 +48,11 @@ if not errorlevel 1 (
   exit /b 0
 )
 
-wscript.exe "%BACKEND_STARTER_VBS%"
+call "%BACKEND_STARTER%"
+if errorlevel 1 (
+  echo [sqlGenie] Backend launch failed, check backend.err.log
+  exit /b 1
+)
 
 "%PYTHON_EXE%" "%HEALTH_CHECKER%" "%HEALTH_URL%" 40 0.5
 

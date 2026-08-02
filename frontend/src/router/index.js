@@ -83,6 +83,17 @@ const routes = [
     },
   },
   {
+    path: '/admin/his-semantics',
+    name: 'admin-his-semantics',
+    component: () => import('../views/admin/AdminHisSemanticsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'HIS 语义目录',
+      componentName: 'AdminHisSemanticsView',
+    },
+  },
+  {
     path: '/:pathMatch(.*)*',
     redirect: '/sql',
   },

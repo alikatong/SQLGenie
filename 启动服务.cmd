@@ -1,3 +1,4 @@
 @echo off
-call "%~dp0start.cmd" %*
+setlocal EnableExtensions
+wscript.exe "%~dp0scripts\start_service_hidden.vbs"
 exit /b %errorlevel%

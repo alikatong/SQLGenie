@@ -9,10 +9,10 @@ from fastapi.testclient import TestClient
 
 from backend.auth import create_access_token
 from backend.config import settings
-from backend.crud import create_db_definition, create_sql_feedback, create_sql_history, create_user
+from backend.crud import create_db_definition, create_sql_feedback, create_sql_history, create_user, replace_table_schema
 from backend.database import db_session, init_db
 from backend.main import app
-from backend.schemas import DbDefinitionCreate, UserCreateRequest
+from backend.schemas import ColumnUpload, DbDefinitionCreate, TableUpload, TableUploadRequest, UserCreateRequest
 
 
 class AdminFeedbackRagApiTests(unittest.TestCase):
@@ -41,6 +41,22 @@ class AdminFeedbackRagApiTests(unittest.TestCase):
                 DbDefinitionCreate(name="admin-rag-db", db_type="mysql"),
                 self.admin["id"],
             )
+            with patch("backend.rag._vector_search_available", return_value=False):
+                replace_table_schema(
+                    connection,
+                    database["id"],
+                    TableUploadRequest(
+                        tables=[
+                            TableUpload(
+                                table_name="orders",
+                                columns=[
+                                    ColumnUpload(column_name="id", data_type="INT"),
+                                    ColumnUpload(column_name="status", data_type="VARCHAR(20)"),
+                                ],
+                            )
+                        ]
+                    ),
+                )
             history = create_sql_history(
                 connection,
                 user_id=self.user["id"],

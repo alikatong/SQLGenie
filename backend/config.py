@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,12 @@ INSECURE_DEFAULT_ADMIN_PASSWORD = "admin123"
 EXAMPLE_SECRET_KEY = "replace-with-a-long-random-secret"
 EXAMPLE_ADMIN_PASSWORD = "replace-with-a-strong-admin-password"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+REASONING_EFFORT_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
+DEFAULT_REASONING_EFFORT: str | None = None
+DEFAULT_PROMPT_MAX_CHARS = 60_000
+MAX_PROMPT_MAX_CHARS = 120_000
+DEFAULT_QWEN_EMBEDDING_MODEL = "models/Qwen3-Embedding-0.6B"
+QWEN_EMBEDDING_FAMILY = "Qwen"
 
 
 def _load_dotenv() -> None:
@@ -33,11 +40,76 @@ def _resolve_db_path(raw_value: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
+def validate_qwen_embedding_model_path(raw_value: object) -> str:
+    """Validate and normalize a local Qwen SentenceTransformer directory."""
+    value = str(raw_value or "").strip()
+    if not value:
+        raise ValueError("必须配置 Qwen Embedding 模型本地目录。")
+
+    model_path = Path(value).expanduser()
+    if not model_path.is_absolute():
+        model_path = BASE_DIR / model_path
+    try:
+        model_path = model_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError("Qwen Embedding 模型目录不存在。") from exc
+
+    if not model_path.is_dir():
+        raise ValueError("Qwen Embedding 模型路径必须是目录。")
+
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise ValueError("Qwen Embedding 模型目录缺少 config.json。")
+
+    try:
+        model_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Qwen Embedding 模型 config.json 无法读取。") from exc
+
+    model_markers = json.dumps(model_config, ensure_ascii=False).casefold()
+    model_markers += f" {model_path.name.casefold()}"
+    if "qwen" not in model_markers:
+        raise ValueError("Embedding 模型必须是 Qwen 系列模型。")
+
+    return str(model_path)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_reasoning_effort(
+    raw_value: object,
+    default: str | None = DEFAULT_REASONING_EFFORT,
+) -> str | None:
+    """Normalize optional provider-specific reasoning strength values."""
+    if raw_value is None:
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in REASONING_EFFORT_VALUES:
+        return normalized
+    return default
+
+
+def normalize_prompt_max_chars(raw_value: object, default: int = DEFAULT_PROMPT_MAX_CHARS) -> int:
+    try:
+        parsed = int(raw_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if parsed < 1_000:
+        return 1_000
+    return min(parsed, MAX_PROMPT_MAX_CHARS)
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
 
 
 _load_dotenv()
@@ -56,16 +128,34 @@ class Settings:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
     llm_enable_thinking: bool = _env_bool("LLM_ENABLE_THINKING", True)
-    llm_thinking_timeout_seconds: int = int(os.getenv("LLM_THINKING_TIMEOUT_SECONDS", "120"))
+    llm_thinking_timeout_seconds: int = int(os.getenv("LLM_THINKING_TIMEOUT_SECONDS", "600"))
+    llm_reasoning_effort: str | None = normalize_reasoning_effort(
+        os.getenv("LLM_REASONING_EFFORT"),
+    )
+    llm_prompt_max_chars: int = _env_int(
+        "LLM_PROMPT_MAX_CHARS",
+        DEFAULT_PROMPT_MAX_CHARS,
+        1_000,
+        MAX_PROMPT_MAX_CHARS,
+    )
     db_path: Path = _resolve_db_path(os.getenv("SQLGENIE_DB_PATH", "sqlgenie.db"))
     rag_embedding_model: str = os.getenv(
         "RAG_EMBEDDING_MODEL",
-        "BAAI/bge-small-zh-v1.5",
+        DEFAULT_QWEN_EMBEDDING_MODEL,
+    )
+    rag_embedding_batch_size: int = min(max(int(os.getenv("RAG_EMBEDDING_BATCH_SIZE", "4")), 1), 32)
+    rag_embedding_max_seq_length: int = min(
+        max(int(os.getenv("RAG_EMBEDDING_MAX_SEQ_LENGTH", "1024")), 128),
+        32_768,
     )
     rag_chroma_path: Path = _resolve_db_path(os.getenv("RAG_CHROMA_PATH", ".chroma"))
-    rag_top_k: int = int(os.getenv("RAG_TOP_K", "30"))
+    rag_top_k: int = min(max(int(os.getenv("RAG_TOP_K", "8")), 1), 20)
     rag_expand_depth: int = int(os.getenv("RAG_EXPAND_DEPTH", "1"))
     rag_min_keyword_hits: int = int(os.getenv("RAG_MIN_KEYWORD_HITS", "2"))
+    rag_min_keyword_score: float = float(os.getenv("RAG_MIN_KEYWORD_SCORE", "6.0"))
+    rag_min_vector_similarity: float = float(os.getenv("RAG_MIN_VECTOR_SIMILARITY", "0.65"))
+    rag_min_vector_margin: float = float(os.getenv("RAG_MIN_VECTOR_MARGIN", "0.08"))
+    his_term_top_k: int = min(max(int(os.getenv("HIS_TERM_TOP_K", "8")), 1), 20)
     feedback_rag_top_k: int = int(os.getenv("FEEDBACK_RAG_TOP_K", "3"))
     rag_collection_prefix: str = os.getenv("RAG_COLLECTION_PREFIX", "sqlgenie")
     cors_origins: str = os.getenv(
@@ -100,12 +190,16 @@ def validate_security_configuration() -> None:
         )
 
 
-def default_model_config() -> dict[str, str | bool | int]:
+def default_model_config() -> dict[str, str | bool | int | None]:
     return {
         "api_key": settings.llm_api_key,
         "base_url": settings.llm_base_url,
         "model_name": settings.llm_model,
         "enable_thinking": settings.llm_enable_thinking,
         "thinking_timeout_seconds": settings.llm_thinking_timeout_seconds,
+        "reasoning_effort": settings.llm_reasoning_effort,
+        "prompt_max_chars": settings.llm_prompt_max_chars,
+        "rag_top_k": settings.rag_top_k,
         "feedback_rag_top_k": settings.feedback_rag_top_k,
+        "embedding_model_path": settings.rag_embedding_model,
     }

@@ -135,6 +135,7 @@ watch(
           <el-menu-item v-else index="/admin/schema-preview">表结构预览</el-menu-item>
           <el-menu-item index="/admin/history">提问历史</el-menu-item>
           <el-menu-item v-if="isAdmin" index="/admin/config">系统配置</el-menu-item>
+          <el-menu-item v-if="isAdmin" index="/admin/his-semantics">HIS 语义目录</el-menu-item>
           <el-menu-item v-if="isAdmin" index="/admin/feedback-rag">反馈 RAG 管理</el-menu-item>
         </el-menu>
       </el-aside>

@@ -12,6 +12,12 @@ frontend/node_modules/
 frontend/dist/
 .chroma/
 models/
+embedding/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
 *.db
 *.sqlite3
 *.log

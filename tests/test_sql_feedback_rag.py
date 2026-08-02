@@ -6,11 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend.config import settings
-from backend.crud import approve_sql_feedback, create_db_definition, create_sql_feedback, create_sql_history, create_user
+from backend.crud import approve_sql_feedback, create_db_definition, create_sql_feedback, create_sql_history, create_user, replace_table_schema
 from backend.database import db_session, init_db
 from backend.llm import SQL_GENERATION_TEMPERATURE, _build_rag_prompt
 from backend.rag import retrieve_sql_feedback_context, sync_sql_feedback_rag_index
-from backend.schemas import DbDefinitionCreate, UserCreateRequest
+from backend.schemas import ColumnUpload, DbDefinitionCreate, TableUpload, TableUploadRequest, UserCreateRequest
 
 
 class SqlFeedbackRagTests(unittest.TestCase):
@@ -31,6 +31,22 @@ class SqlFeedbackRagTests(unittest.TestCase):
                 DbDefinitionCreate(name="rag-db", db_type="mysql"),
                 user["id"],
             )
+            with patch("backend.rag._vector_search_available", return_value=False):
+                replace_table_schema(
+                    connection,
+                    database["id"],
+                    TableUploadRequest(
+                        tables=[
+                            TableUpload(
+                                table_name="orders",
+                                columns=[
+                                    ColumnUpload(column_name="id", data_type="INT"),
+                                    ColumnUpload(column_name="status", data_type="VARCHAR(20)"),
+                                ],
+                            )
+                        ]
+                    ),
+                )
             history = create_sql_history(
                 connection,
                 user_id=user["id"],

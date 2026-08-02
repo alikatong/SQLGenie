@@ -15,6 +15,11 @@ if not exist "%ENV_FILE%" (
   )
 )
 
+if not defined PYTHON_EXE (
+  echo [sqlGenie] Python 3.10+ was not found. Install Python or set PYTHON_EXE.
+  exit /b 1
+)
+
 if not exist "%PYTHON_EXE%" (
   echo [sqlGenie] Missing Python runtime: %PYTHON_EXE%
   exit /b 1
@@ -25,9 +30,20 @@ if not exist "%NODE_EXE%" (
   exit /b 1
 )
 
-if not exist "%PYTHON_PACKAGES%" (
+if not exist "%PROJECT_PYTHON_EXE%" (
+  echo [sqlGenie] Creating project-local Python environment...
+  "%PYTHON_EXE%" -m venv "%VENV_DIR%"
+  if errorlevel 1 (
+    echo [sqlGenie] Project Python environment creation failed.
+    exit /b 1
+  )
+)
+
+set "PYTHON_EXE=%PROJECT_PYTHON_EXE%"
+
+if not exist "%PYTHON_PACKAGES%\fastapi\__init__.py" (
   echo [sqlGenie] Installing backend dependencies...
-  "%PYTHON_EXE%" -m pip install -r backend\requirements.txt --target .python_packages
+  "%PYTHON_EXE%" -m pip install --disable-pip-version-check -r backend\requirements.txt --target .python_packages
   if errorlevel 1 (
     echo [sqlGenie] Backend dependency installation failed.
     exit /b 1

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import mimetypes
+import logging
 import sqlite3
+import uuid
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
+from time import monotonic
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,40 +15,56 @@ from starlette.responses import FileResponse, Response
 
 from .auth import create_access_token, get_current_user, require_admin
 from .config import settings, validate_security_configuration
+from .config import validate_qwen_embedding_model_path
 from .crud import (
+    FeedbackValidationError,
     authenticate_user,
+    create_his_semantic_term,
+    create_generation_trace,
     create_sql_feedback,
     create_sql_history,
     create_user,
     create_db_definition,
     delete_user,
+    delete_his_semantic_term,
     delete_db_definition,
     delete_sql_feedback,
     approve_sql_feedback,
     delete_single_table_schema,
     get_db_definition,
     get_feedback_rag_config,
-    get_model_config,
+    get_model_config_view,
+    get_model_runtime_config,
     get_schema_bundle,
     get_table_schema,
     list_sql_history_for_user,
     list_sql_history,
     list_sql_feedback,
+    list_his_semantic_terms,
     list_users,
     list_db_definitions,
     reset_user_password,
+    purge_expired_generation_data,
     replace_table_schema,
     update_user_role,
     validate_persisted_admin_password,
     upsert_single_table_schema,
     update_db_definition,
     update_feedback_rag_config,
+    update_his_semantic_term,
     update_model_config,
 )
 from .database import db_session, init_db
-from .llm import generate_sql_with_llm
+from .generation import GenerationError, orchestrate_sql_generation
+from .his_semantics import retrieve_his_semantics
+from .intent import analyze_intent
 from .models import AuthenticatedUser
-from .rag import retrieve_schema_context, retrieve_sql_feedback_context, sync_sql_feedback_rag_index
+from .rag import (
+    initialize_database_rag,
+    retrieve_schema_context,
+    retrieve_sql_feedback_context,
+    sync_sql_feedback_rag_index,
+)
 from .schemas import (
     ConfigUpdate,
     ConfigView,
@@ -56,8 +76,14 @@ from .schemas import (
     FeedbackRagConfigView,
     FeedbackRagExamplePageResponse,
     FeedbackRagExampleQuery,
+    EmbeddingRagInitializationResponse,
     GenerateSqlRequest,
     GenerateSqlResponse,
+    HisSemanticTermCreate,
+    HisSemanticTermOut,
+    HisSemanticTermPageResponse,
+    HisSemanticTermQuery,
+    HisSemanticTermUpdate,
     LoginRequest,
     LoginResponse,
     SqlHistoryPageResponse,
@@ -78,6 +104,26 @@ from .schemas import (
 # Windows 上 .js 可能被错误映射成 text/plain，导致前端模块脚本不执行。
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("application/javascript", ".mjs")
+logger = logging.getLogger(__name__)
+
+
+def _structured_item(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if is_dataclass(value):
+        return asdict(value)
+    return {"code": "UNKNOWN", "message": str(value)}
+
+
+def _persist_trace_safely(trace: dict) -> None:
+    try:
+        with db_session() as connection:
+            purge_expired_generation_data(connection)
+            create_generation_trace(connection, trace)
+    except Exception:
+        logger.exception("Failed to persist generation trace request_id=%s", trace.get("request_id"))
 
 
 def _apply_no_cache(response: Response) -> Response:
@@ -115,6 +161,7 @@ def on_startup() -> None:
     init_db()
     with db_session() as connection:
         validate_persisted_admin_password(connection)
+        purge_expired_generation_data(connection, force=True)
 
 
 @app.get("/api/health")
@@ -364,45 +411,138 @@ async def generate_sql(
     payload: GenerateSqlRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateSqlResponse:
+    request_id = str(uuid.uuid4())
+    request_started_at = monotonic()
+    dialect_mismatch = False
     with db_session() as connection:
         schema_bundle = get_schema_bundle(connection, payload.db_id)
-        model_config = get_model_config(connection)
+        model_config = get_model_runtime_config(connection)
 
         if schema_bundle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="数据库定义不存在。",
             )
-        if not schema_bundle["tables"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="当前数据库定义尚未导入表结构，无法生成 SQL。",
+        dialect_mismatch = payload.target_db_type != schema_bundle["db_definition"]["db_type"]
+        if not dialect_mismatch:
+            semantic_context = retrieve_his_semantics(
+                connection,
+                db_id=payload.db_id,
+                question=payload.natural_text,
+                schema_bundle=schema_bundle,
+            )
+            intent_result = analyze_intent(
+                payload.natural_text,
+                schema_bundle=schema_bundle,
+                his_semantics=semantic_context["terms"],
+            )
+            rag_context = retrieve_schema_context(
+                connection,
+                schema_bundle=schema_bundle,
+                question=payload.natural_text,
+                term_matches=semantic_context["table_bindings"],
+                term_columns=semantic_context["table_binding_columns"],
+                explicit_tables=intent_result.explicit_tables,
+                explicit_columns=intent_result.explicit_columns,
+                top_k=int(model_config["rag_top_k"]),
+            )
+            feedback_context = retrieve_sql_feedback_context(
+                connection,
+                db_id=payload.db_id,
+                question=payload.natural_text,
+                target_db_type=payload.target_db_type,
+                top_k=int(model_config["feedback_rag_top_k"]),
             )
 
-        rag_context = retrieve_schema_context(
-            connection,
-            schema_bundle=schema_bundle,
-            question=payload.natural_text,
+    if dialect_mismatch:
+        _persist_trace_safely(
+            {
+                "request_id": request_id,
+                "user_id": current_user.id,
+                "db_id": payload.db_id,
+                "prompt_version": "his-sql-v1",
+                "policy_version": "sql-policy-v1",
+                "model_name": str(model_config["model_name"]),
+                "policy_status": "not_run",
+                "model_calls": 0,
+                "outcome": "error",
+                "error_code": "DIALECT_MISMATCH",
+            }
         )
-        feedback_context = retrieve_sql_feedback_context(
-            connection,
-            db_id=payload.db_id,
-            question=payload.natural_text,
-            target_db_type=payload.target_db_type,
-            top_k=int(model_config["feedback_rag_top_k"]),
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "DIALECT_MISMATCH",
+                "message": "目标方言与数据库定义不一致。",
+                "request_id": request_id,
+            },
         )
 
-    llm_result = await generate_sql_with_llm(
-        model_config=model_config,
-        target_db_type=payload.target_db_type,
-        natural_text=payload.natural_text,
-        retrieved_tables_ddl=rag_context["retrieved_tables_ddl"],
-        operation=rag_context["operation"],
-        feedback_examples=feedback_context["examples"],
-    )
-    sql = llm_result["sql"]
+    # No SQLite connection or transaction exists during remote model calls.
+    try:
+        generation_result = await orchestrate_sql_generation(
+            model_config,
+            target_db_type=payload.target_db_type,
+            natural_text=payload.natural_text,
+            schema_bundle=schema_bundle,
+            schema_evidence=rag_context["retrieved_evidence"],
+            his_semantics=semantic_context["terms"],
+            verified_examples=feedback_context["examples"],
+            intent_result=intent_result,
+            request_started_at=request_started_at,
+        )
+        if (
+            generation_result.no_sql_code == "LOW_SCHEMA_EVIDENCE"
+            and rag_context.get("clarification_reason")
+        ):
+            generation_result = replace(
+                generation_result,
+                reason=str(rag_context["clarification_reason"]),
+            )
+    except GenerationError as exc:
+        _persist_trace_safely(
+            {
+                "request_id": request_id,
+                "user_id": current_user.id,
+                "db_id": payload.db_id,
+                "prompt_version": exc.prompt_version,
+                "policy_version": exc.policy_version,
+                "context_hash": exc.context_hash,
+                "model_name": str(model_config["model_name"]),
+                "retrieval_mode": rag_context["retrieval_mode"],
+                "retrieved_tables_json": rag_context["retrieved_evidence"],
+                "retrieved_terms_json": semantic_context["retrieved_terms"],
+                "policy_status": getattr(exc, "validation_status", "not_run"),
+                "validation_errors_json": [
+                    _structured_item(item)
+                    for item in getattr(exc, "validation_errors", ())
+                ],
+                "warnings_json": [
+                    _structured_item(item)
+                    for item in (
+                        getattr(exc, "warnings", ())
+                        or tuple(_structured_item(item) for item in intent_result.warnings)
+                    )
+                ],
+                "model_calls": exc.model_calls,
+                "outcome": "error",
+                "error_code": exc.error_code,
+                "duration_ms": exc.duration_ms,
+                "prompt_chars": exc.prompt_chars,
+                "prompt_tokens": exc.prompt_tokens,
+                "completion_tokens": exc.completion_tokens,
+            }
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.error_code, "message": exc.message, "request_id": request_id},
+        ) from exc
+
+    result = generation_result.to_dict()
+    sql = generation_result.sql
 
     with db_session() as connection:
+        purge_expired_generation_data(connection)
         history = create_sql_history(
             connection,
             user_id=current_user.id,
@@ -413,12 +553,49 @@ async def generate_sql(
             retrieved_tables=rag_context["retrieved_tables"],
         )
 
+    _persist_trace_safely(
+        {
+            "request_id": request_id,
+            "history_id": history["id"],
+            "user_id": current_user.id,
+            "db_id": payload.db_id,
+            "prompt_version": generation_result.prompt_version,
+            "policy_version": generation_result.policy_version,
+            "context_hash": generation_result.context_hash,
+            "model_name": str(model_config["model_name"]),
+            "retrieval_mode": rag_context["retrieval_mode"],
+            "retrieved_tables_json": rag_context["retrieved_evidence"],
+            "retrieved_terms_json": semantic_context["retrieved_terms"],
+            "policy_status": generation_result.validation_status,
+            "validation_errors_json": result["validation_errors"],
+            "warnings_json": result["warnings"],
+            "model_calls": generation_result.model_calls,
+            "outcome": "passed" if generation_result.validation_status == "passed" else "no_sql",
+            "error_code": generation_result.no_sql_code or None,
+            "duration_ms": generation_result.duration_ms,
+            "prompt_chars": generation_result.prompt_chars,
+            "prompt_tokens": generation_result.prompt_tokens,
+            "completion_tokens": generation_result.completion_tokens,
+        }
+    )
+
     return GenerateSqlResponse(
         sql=sql,
-        no_sql_reason=llm_result["reason"],
+        no_sql_reason=generation_result.reason,
         retrieved_tables=rag_context["retrieved_tables"],
         retrieval_mode=rag_context["retrieval_mode"],
         history_id=history["id"],
+        request_id=request_id,
+        prompt_version=generation_result.prompt_version,
+        policy_version=generation_result.policy_version,
+        no_sql_code=generation_result.no_sql_code,
+        validation_status=generation_result.validation_status,
+        validation_errors=result["validation_errors"],
+        warnings=result["warnings"],
+        assumptions=list(generation_result.assumptions),
+        retrieved_evidence=rag_context["retrieved_evidence"],
+        retrieved_terms=semantic_context["retrieved_terms"],
+        model_calls=generation_result.model_calls,
     )
 
 
@@ -449,6 +626,11 @@ def submit_sql_feedback(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="该 SQL 生成记录已提交过反馈。",
+        ) from exc
+    except FeedbackValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "FEEDBACK_VALIDATION_FAILED", "issues": exc.issues},
         ) from exc
 
 
@@ -489,11 +671,69 @@ def approve_feedback_rag_example(
     feedback_id: int,
     current_user: AuthenticatedUser = Depends(require_admin),
 ) -> None:
+    try:
+        with db_session() as connection:
+            db_id = approve_sql_feedback(connection, feedback_id)
+            if db_id is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback example not found.")
+            sync_sql_feedback_rag_index(connection, db_id)
+    except FeedbackValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "FEEDBACK_VALIDATION_FAILED", "issues": exc.issues},
+        ) from exc
+
+
+@app.get("/api/his-terms", response_model=HisSemanticTermPageResponse)
+def fetch_his_terms(
+    query: HisSemanticTermQuery = Depends(),
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> dict:
     with db_session() as connection:
-        db_id = approve_sql_feedback(connection, feedback_id)
-        if db_id is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback example not found.")
-        sync_sql_feedback_rag_index(connection, db_id)
+        return list_his_semantic_terms(connection, query)
+
+
+@app.post("/api/his-terms", response_model=HisSemanticTermOut, status_code=status.HTTP_201_CREATED)
+def create_his_term(
+    payload: HisSemanticTermCreate,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> dict:
+    try:
+        with db_session() as connection:
+            return create_his_semantic_term(connection, payload, current_user.id)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="同一作用域内术语名称已存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put("/api/his-terms/{term_id}", response_model=HisSemanticTermOut)
+def save_his_term(
+    term_id: int,
+    payload: HisSemanticTermUpdate,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> dict:
+    try:
+        with db_session() as connection:
+            updated = update_his_semantic_term(connection, term_id, payload)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="同一作用域内术语名称已存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HIS 术语不存在。")
+    return updated
+
+
+@app.delete("/api/his-terms/{term_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_his_term(
+    term_id: int,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> None:
+    with db_session() as connection:
+        deleted = delete_his_semantic_term(connection, term_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HIS 术语不存在。")
 
 
 @app.get("/api/feedback-rag/config", response_model=FeedbackRagConfigView)
@@ -516,7 +756,7 @@ def save_feedback_rag_config(
 @app.get("/api/config", response_model=ConfigView)
 def fetch_config(current_user: AuthenticatedUser = Depends(require_admin)) -> dict[str, str]:
     with db_session() as connection:
-        return get_model_config(connection)
+        return get_model_config_view(connection)
 
 
 @app.put("/api/config", response_model=ConfigView)
@@ -524,8 +764,74 @@ def save_config(
     payload: ConfigUpdate,
     current_user: AuthenticatedUser = Depends(require_admin),
 ) -> dict[str, str]:
+    try:
+        with db_session() as connection:
+            return update_model_config(connection, payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_EMBEDDING_MODEL", "message": str(exc)},
+        ) from exc
+
+
+@app.post(
+    "/api/embedding-rag/initialize",
+    response_model=EmbeddingRagInitializationResponse,
+)
+def initialize_embedding_rag(
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> dict:
+    started_at = monotonic()
     with db_session() as connection:
-        return update_model_config(connection, payload)
+        runtime = get_model_runtime_config(connection)
+        try:
+            model_path = validate_qwen_embedding_model_path(runtime["embedding_model_path"])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "INVALID_EMBEDDING_MODEL", "message": str(exc)},
+            ) from exc
+
+        settings.rag_embedding_model = model_path
+        database_definitions = list_db_definitions(connection)
+        initialized_databases: list[dict] = []
+        failed_databases: list[dict] = []
+        schema_table_count = 0
+        feedback_example_count = 0
+
+        for database in database_definitions:
+            result = {
+                "db_id": int(database["id"]),
+                "name": str(database["name"]),
+                "table_count": 0,
+                "feedback_example_count": 0,
+                "error": "",
+            }
+            try:
+                schema_bundle = get_schema_bundle(connection, int(database["id"]))
+                if schema_bundle is None:
+                    raise ValueError("数据库定义不存在。")
+                stats = initialize_database_rag(connection, schema_bundle)
+                result["table_count"] = int(stats["table_count"])
+                result["feedback_example_count"] = int(stats["feedback_example_count"])
+                schema_table_count += result["table_count"]
+                feedback_example_count += result["feedback_example_count"]
+                initialized_databases.append(result)
+            except Exception as exc:
+                logger.exception("Embedding RAG initialization failed for db_id=%s", database["id"])
+                result["error"] = str(exc)
+                failed_databases.append(result)
+
+    return {
+        "embedding_model_path": model_path,
+        "embedding_model_family": "Qwen",
+        "database_count": len(database_definitions),
+        "schema_table_count": schema_table_count,
+        "feedback_example_count": feedback_example_count,
+        "initialized_databases": initialized_databases,
+        "failed_databases": failed_databases,
+        "duration_ms": int((monotonic() - started_at) * 1000),
+    }
 
 
 frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"

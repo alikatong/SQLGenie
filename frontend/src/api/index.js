@@ -1,5 +1,7 @@
 import axios from 'axios'
-import { authState, clearSession } from '../stores/auth'
+import { authState, clearSession } from '../stores/auth.js'
+
+export const SQL_GENERATION_HTTP_TIMEOUT_MS = 660_000
 
 const apiClient = axios.create({
   baseURL: '/api',
@@ -86,7 +88,7 @@ export function deleteSingleTableSchema(dbId, tableName, payload) {
 
 export function generateSql(payload) {
   return apiClient
-    .post('/generate-sql', payload, { timeout: 600000 })
+    .post('/generate-sql', payload, { timeout: SQL_GENERATION_HTTP_TIMEOUT_MS })
     .then((response) => response.data)
 }
 
@@ -124,6 +126,28 @@ export function getConfig() {
 
 export function updateConfig(payload) {
   return apiClient.put('/config', payload).then((response) => response.data)
+}
+
+export function initializeEmbeddingRag() {
+  return apiClient
+    .post('/embedding-rag/initialize', null, { timeout: 30 * 60 * 1000 })
+    .then((response) => response.data)
+}
+
+export function getHisTerms(params) {
+  return apiClient.get('/his-terms', { params }).then((response) => response.data)
+}
+
+export function createHisTerm(payload) {
+  return apiClient.post('/his-terms', payload).then((response) => response.data)
+}
+
+export function updateHisTerm(id, payload) {
+  return apiClient.put(`/his-terms/${id}`, payload).then((response) => response.data)
+}
+
+export function deleteHisTerm(id) {
+  return apiClient.delete(`/his-terms/${id}`).then((response) => response.data)
 }
 
 export default apiClient

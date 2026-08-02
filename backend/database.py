@@ -108,6 +108,63 @@ CREATE TABLE IF NOT EXISTS schema_rag_index (
     FOREIGN KEY (db_id) REFERENCES db_definitions(id) ON DELETE CASCADE,
     FOREIGN KEY (table_id) REFERENCES table_meta(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS his_semantic_term (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    db_id INTEGER,
+    term TEXT NOT NULL,
+    synonyms_json TEXT NOT NULL DEFAULT '[]',
+    definition TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN ('entity', 'event', 'time', 'status', 'metric', 'relation')),
+    bindings_json TEXT NOT NULL DEFAULT '[]',
+    sql_hint TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (db_id) REFERENCES db_definitions(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_his_semantic_term_scope_name
+ON his_semantic_term(IFNULL(db_id, -1), lower(term));
+
+CREATE INDEX IF NOT EXISTS idx_his_semantic_term_db_enabled
+ON his_semantic_term(db_id, enabled, id DESC);
+
+CREATE TABLE IF NOT EXISTS generation_trace (
+    request_id TEXT PRIMARY KEY,
+    history_id INTEGER,
+    user_id INTEGER NOT NULL,
+    db_id INTEGER NOT NULL,
+    prompt_version TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    context_hash TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    retrieval_mode TEXT NOT NULL DEFAULT '',
+    retrieved_tables_json TEXT NOT NULL DEFAULT '[]',
+    retrieved_terms_json TEXT NOT NULL DEFAULT '[]',
+    policy_status TEXT NOT NULL CHECK(policy_status IN ('passed', 'failed', 'not_run')),
+    validation_errors_json TEXT NOT NULL DEFAULT '[]',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    model_calls INTEGER NOT NULL DEFAULT 0 CHECK(model_calls BETWEEN 0 AND 2),
+    outcome TEXT NOT NULL CHECK(outcome IN ('passed', 'no_sql', 'error')),
+    error_code TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (history_id) REFERENCES sql_history(id) ON DELETE SET NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (db_id) REFERENCES db_definitions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_trace_created_at
+ON generation_trace(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_generation_trace_db_created
+ON generation_trace(db_id, created_at DESC);
 """
 
 

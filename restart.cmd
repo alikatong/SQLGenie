@@ -20,7 +20,11 @@ if "%SHOULD_REBUILD%"=="1" (
 )
 
 powershell -NoProfile -Command "Start-Sleep -Seconds 2"
-wscript.exe "%BACKEND_STARTER_VBS%"
+call "%BACKEND_STARTER%"
+if errorlevel 1 (
+  echo [sqlGenie] Backend launch failed, check backend.err.log
+  exit /b 1
+)
 "%PYTHON_EXE%" "%HEALTH_CHECKER%" "%HEALTH_URL%" 40 0.5
 if errorlevel 1 (
   echo [sqlGenie] Restart failed, check backend.err.log
