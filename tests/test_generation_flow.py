@@ -145,6 +145,20 @@ def test_invalid_first_candidate_gets_one_repair(monkeypatch) -> None:
     assert result.prompt_tokens == 20
 
 
+def test_legacy_enable_thinking_flag_disables_repair(monkeypatch) -> None:
+    result, calls = _run(
+        monkeypatch,
+        [_result(1, "DELETE FROM visit_record"), _result(2, "SELECT id FROM visit_record")],
+        model_config={**CONFIG, "enable_thinking": False},
+    )
+
+    assert calls == [1]
+    assert result.sql == "NO_SQL"
+    assert result.validation_status == "failed"
+    assert result.no_sql_code == "VALIDATION_FAILED"
+    assert result.model_calls == 1
+
+
 def test_second_invalid_candidate_returns_failed_no_sql(monkeypatch) -> None:
     result, calls = _run(
         monkeypatch,

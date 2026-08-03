@@ -60,6 +60,7 @@ class _EmbeddingRuntime:
         self._model: Any = None
         self._model_name = ""
         self._model_max_seq_length: int | None = None
+        self._lock = threading.Lock()
 
     def is_available(self) -> bool:
         return chromadb is not None and SentenceTransformer is not None
@@ -76,28 +77,41 @@ class _EmbeddingRuntime:
 
         model_name = _embedding_model_path(model_path)
         max_seq_length = int(settings.rag_embedding_max_seq_length)
-        if (
-            self._model is None
-            or self._model_name != model_name
-            or self._model_max_seq_length != max_seq_length
-        ):
-            self._model = SentenceTransformer(
-                model_name,
-                local_files_only=_prefer_local_model_files(model_name),
-                trust_remote_code=_model_requires_remote_code(model_name),
-            )
-            self._model.max_seq_length = min(
-                self._model.max_seq_length,
-                max_seq_length,
-            )
-            self._model_name = model_name
-            self._model_max_seq_length = max_seq_length
 
+        # Capture the model under protection, then encode with that exact
+        # instance so a concurrent model switch cannot affect this request.
+        with self._lock:
+            if (
+                self._model is None
+                or self._model_name != model_name
+                or self._model_max_seq_length != max_seq_length
+            ):
+                self._model = SentenceTransformer(
+                    model_name,
+                    local_files_only=_prefer_local_model_files(model_name),
+                    trust_remote_code=_model_requires_remote_code(model_name),
+                )
+                self._model.max_seq_length = min(
+                    self._model.max_seq_length,
+                    max_seq_length,
+                )
+                self._model_name = model_name
+                self._model_max_seq_length = max_seq_length
+            model = self._model
+        return self._encode_inner(model, texts, kind, model_name)
+
+    def _encode_inner(
+        self,
+        model: Any,
+        texts: list[str],
+        kind: str,
+        model_name: str,
+    ) -> list[list[float]]:
         encoded_inputs = [
             _prepare_embedding_input(text, kind=kind, model_name=model_name)
             for text in texts
         ]
-        vectors = self._model.encode(
+        vectors = model.encode(
             encoded_inputs,
             batch_size=settings.rag_embedding_batch_size,
             normalize_embeddings=True,
